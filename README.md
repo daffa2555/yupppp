@@ -58,8 +58,8 @@ nope ❌  (3 blockers, 0 warnings · 11ms · exit 1)
 # 1-line install (Linux x86_64, macOS arm64/x86_64 · verifies SHA-256)
 curl -fsSL https://raw.githubusercontent.com/daffa2555/yupppp/main/install.sh | sh
 
-# Or install from source via Cargo
-cargo install --git https://github.com/daffa2555/yupppp
+# Or install from crates.io via Cargo
+cargo install yupp
 
 # Scan branch diff before opening a PR
 yupp main..HEAD
