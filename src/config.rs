@@ -1,4 +1,5 @@
 use crate::ast::{Finding, Severity};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -158,31 +159,47 @@ impl Config {
     }
 
     pub fn is_ignored(&self, rel_path: &str) -> bool {
-        let normalized = rel_path.replace('\\', "/");
+        if self.ignore.is_empty() {
+            return false;
+        }
+        let normalized: Cow<'_, str> = if rel_path.contains('\\') {
+            Cow::Owned(rel_path.replace('\\', "/"))
+        } else {
+            Cow::Borrowed(rel_path)
+        };
+        let normalized = normalized.as_ref();
+
         for pat in &self.ignore {
-            let p = pat.trim().replace('\\', "/");
-            if p.is_empty() {
+            let trimmed = pat.trim();
+            if trimmed.is_empty() {
                 continue;
             }
+            let p_cow: Cow<'_, str> = if trimmed.contains('\\') {
+                Cow::Owned(trimmed.replace('\\', "/"))
+            } else {
+                Cow::Borrowed(trimmed)
+            };
+            let p = p_cow.as_ref();
+
             if let Some(dir) = p.strip_prefix("**/").and_then(|s| s.strip_suffix("/**")) {
                 if !dir.is_empty()
-                    && (normalized.starts_with(&format!("{}/", dir))
-                        || normalized.contains(&format!("/{}/", dir))
-                        || normalized == dir)
+                    && (normalized == dir
+                        || starts_with_dir(normalized, dir)
+                        || contains_dir_segment(normalized, dir))
                 {
                     return true;
                 }
             } else if let Some(prefix) = p.strip_suffix("/**") {
                 if !prefix.is_empty()
                     && (normalized == prefix
-                        || normalized.starts_with(&format!("{}/", prefix))
-                        || normalized.contains(&format!("/{}/", prefix)))
+                        || starts_with_dir(normalized, prefix)
+                        || contains_dir_segment(normalized, prefix))
                 {
                     return true;
                 }
             } else if let Some(suffix) = p.strip_prefix("**/") {
                 if normalized == suffix
-                    || normalized.ends_with(&format!("/{}", suffix))
+                    || ends_with_segment(normalized, suffix)
                     || (suffix.starts_with('*') && normalized.ends_with(&suffix[1..]))
                 {
                     return true;
@@ -192,12 +209,12 @@ impl Config {
                     return true;
                 }
             } else if p.ends_with('/') {
-                if normalized.starts_with(&p) || normalized.contains(&format!("/{}", p)) {
+                if normalized.starts_with(p) || contains_slash_prefix(normalized, p) {
                     return true;
                 }
             } else if normalized == p
-                || normalized.starts_with(&format!("{}/", p))
-                || normalized.ends_with(&format!("/{}", p))
+                || starts_with_dir(normalized, p)
+                || ends_with_segment(normalized, p)
             {
                 return true;
             }
@@ -223,6 +240,47 @@ impl Config {
             })
             .collect()
     }
+}
+
+fn starts_with_dir(path: &str, dir: &str) -> bool {
+    path.strip_prefix(dir).is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn ends_with_segment(path: &str, seg: &str) -> bool {
+    path.strip_suffix(seg).is_some_and(|rest| rest.ends_with('/'))
+}
+
+fn contains_dir_segment(path: &str, dir: &str) -> bool {
+    let step = dir.chars().next().map_or(1, char::len_utf8);
+    let mut start = 0;
+    while let Some(pos) = path[start..].find(dir) {
+        let abs = start + pos;
+        let end = abs + dir.len();
+        if abs > 0 && path.as_bytes()[abs - 1] == b'/' && path.as_bytes().get(end) == Some(&b'/') {
+            return true;
+        }
+        start = abs + step;
+        if start >= path.len() {
+            break;
+        }
+    }
+    false
+}
+
+fn contains_slash_prefix(path: &str, prefix_with_slash: &str) -> bool {
+    let step = prefix_with_slash.chars().next().map_or(1, char::len_utf8);
+    let mut start = 0;
+    while let Some(pos) = path[start..].find(prefix_with_slash) {
+        let abs = start + pos;
+        if abs > 0 && path.as_bytes()[abs - 1] == b'/' {
+            return true;
+        }
+        start = abs + step;
+        if start >= path.len() {
+            break;
+        }
+    }
+    false
 }
 
 fn rule_matches_prefix(pattern: &str, rule: &str) -> bool {
@@ -255,10 +313,10 @@ fn strip_toml_comment(line: &str) -> &str {
 
 fn unquote(s: &str) -> String {
     let s = s.trim();
-    if (s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')) {
-        if s.len() >= 2 {
-            return s[1..s.len() - 1].to_string();
-        }
+    if s.len() >= 2
+        && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
+    {
+        return s[1..s.len() - 1].to_string();
     }
     s.to_string()
 }

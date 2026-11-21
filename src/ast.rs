@@ -1,11 +1,15 @@
 use crate::config::Config;
-use crate::diff::{git_show_file, FileDiff};
+use crate::diff::{git_show_files_batch, is_test_path, FileDiff};
+use regex::bytes::RegexSetBuilder as BytesRegexSetBuilder;
 use regex::Regex;
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
+use std::io::Read;
 use std::path::Path;
-use tree_sitter::{Language, Node, Parser};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
+use tree_sitter::{Language, Node, Parser, Tree};
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -107,20 +111,20 @@ struct DiffContext {
 }
 
 fn detect_lang(path: &str) -> Option<Lang> {
-    let p = path.to_lowercase();
-    if p.ends_with(".py") {
+    let (_, ext) = path.rsplit_once('.')?;
+    if ext.eq_ignore_ascii_case("py") {
         Some(Lang::Python)
-    } else if p.ends_with(".rs") {
+    } else if ext.eq_ignore_ascii_case("rs") {
         Some(Lang::Rust)
-    } else if p.ends_with(".ts") || p.ends_with(".tsx") {
+    } else if ext.eq_ignore_ascii_case("ts") || ext.eq_ignore_ascii_case("tsx") {
         Some(Lang::TypeScript)
-    } else if p.ends_with(".js")
-        || p.ends_with(".jsx")
-        || p.ends_with(".mjs")
-        || p.ends_with(".cjs")
+    } else if ext.eq_ignore_ascii_case("js")
+        || ext.eq_ignore_ascii_case("jsx")
+        || ext.eq_ignore_ascii_case("mjs")
+        || ext.eq_ignore_ascii_case("cjs")
     {
         Some(Lang::JavaScript)
-    } else if p.ends_with(".go") {
+    } else if ext.eq_ignore_ascii_case("go") {
         Some(Lang::Go)
     } else {
         None
@@ -137,31 +141,628 @@ fn ts_language(lang: Lang) -> Language {
     }
 }
 
-fn is_test_path(rel_path: &str) -> bool {
-    FileDiff {
-        path: rel_path.to_string(),
-        added: vec![],
-        removed: vec![],
-        is_deleted: false,
+fn ts_language_for_path(lang: Lang, path: &str) -> Language {
+    match lang {
+        Lang::TypeScript
+            if path
+                .rsplit_once('.')
+                .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("tsx")) =>
+        {
+            tree_sitter_typescript::LANGUAGE_TSX.into()
+        }
+        _ => ts_language(lang),
     }
-    .is_test_file()
+}
+
+fn parse_source(parser: &mut Parser, lang: Lang, path: &str, source: &str) -> Option<Tree> {
+    parser.set_language(&ts_language_for_path(lang, path)).ok()?;
+    parser.parse(source, None)
+}
+
+fn walk_cursor<F: FnMut(Node) -> bool>(root: Node, mut visit: F) {
+    let mut cursor = root.walk();
+    loop {
+        let node = cursor.node();
+        if visit(node) && cursor.goto_first_child() {
+            continue;
+        }
+        if cursor.goto_next_sibling() {
+            continue;
+        }
+        loop {
+            if !cursor.goto_parent() {
+                return;
+            }
+            if cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+}
+
+fn range_touches_lines(sorted_lines: &[usize], start_line: usize, end_line: usize) -> bool {
+    let idx = sorted_lines.partition_point(|&l| l < start_line);
+    idx < sorted_lines.len() && sorted_lines[idx] <= end_line
 }
 
 const ASSERT_PATTERN: &str = r"(\bassert\b|\bassert_eq!\s*\(|\bassert_ne!\s*\(|\bassert!\s*\(|\bexpect\s*\(|\btoBe\s*\(|\btoEqual\s*\(|\bassertEqual\b|\bassertTrue\b|\bassertFalse\b|\bassertRaises\b|\bt\.Error|\bt\.Fatal|\brequire\.|\bassert\.)";
 
+fn compile_static_regex(pat: &str) -> Regex {
+    match Regex::new(pat) {
+        Ok(re) => re,
+        Err(e) => panic!("invalid static regex: {}", e),
+    }
+}
+
+macro_rules! static_regex {
+    ($name:ident, $pat:expr) => {
+        fn $name() -> &'static Regex {
+            static RE: OnceLock<Regex> = OnceLock::new();
+            RE.get_or_init(|| compile_static_regex($pat))
+        }
+    };
+}
+
+static_regex!(assert_re, ASSERT_PATTERN);
+static_regex!(
+    skip_re,
+    r"(\.skip\s*\(|\bxit\s*\(|\bxdescribe\s*\(|@pytest\.mark\.skip|@unittest\.skip|#\[ignore\b|t\.Skip\s*\()"
+);
+static_regex!(
+    trivial_assert_re,
+    r"(\bassert\s+True\b|\bassert\s+1\s*==\s*1\b|\bassert\s+not\s+False\b|\bexpect\s*\(\s*true\s*\)\s*\.toBe\s*\(\s*true\s*\)|\bexpect\s*\(\s*true\s*\)\s*\.toBeTruthy\s*\(\s*\)|\bexpect\s*\(\s*1\s*\)\s*\.toBe\s*\(\s*1\s*\)|\bassert!\s*\(\s*true\s*\)|\bassert_eq!\s*\(\s*1\s*,\s*1\s*\))"
+);
+static_regex!(
+    suppress_re,
+    r"(@ts-ignore|@ts-nocheck|#\s*type:\s*ignore|#\[allow\(warnings\)\])"
+);
+static_regex!(unwrap_re, r"\.(unwrap|expect)\s*\(");
+static_regex!(
+    todo_re,
+    r"(\btodo!\s*\(|\bunimplemented!\s*\(|\bNotImplementedError\b)"
+);
+static_regex!(
+    placeholder_comment_re,
+    r"(?i)(?://|#|/\*)\s*(?:TODO\s*:?\s*(?:implement|fill|add|complete|fix|stub)|implement\s+(?:logic|this|here|me|later)|placeholder\s+implementation)"
+);
+static_regex!(
+    hard_debug_re,
+    r"(\bbreakpoint\s*\(|\bpdb\.set_trace\s*\(|\bipdb\.set_trace\s*\(|\bdebugger\s*;)"
+);
+static_regex!(
+    soft_debug_re,
+    r"(\bconsole\.(log|debug)\s*\(|\bdbg!\s*\(|\bfmt\.Println\s*\()"
+);
+static_regex!(
+    py_fallback_re,
+    r"^return\s+(None|False|True|\{\}|\[\]|''|\x22\x22|0)\s*$"
+);
+static_regex!(
+    js_fallback_re,
+    r"^return(\s+(null|undefined|false|true|\{\}|\[\]|''|\x22\x22|0))?\s*;?$"
+);
+static_regex!(
+    js_file_mock_re,
+    r#"\b(?:jest|vi)\.mock\s*\(\s*['"`]([^'"`]+)['"`]"#
+);
+
+fn secret_rules() -> &'static [(&'static str, Regex)] {
+    static RULES: OnceLock<Vec<(&'static str, Regex)>> = OnceLock::new();
+    RULES.get_or_init(|| {
+        vec![
+            (
+                "secret/stripe",
+                compile_static_regex(r"\bsk_(?:live|test)_[A-Za-z0-9]{16,}\b"),
+            ),
+            ("secret/aws", compile_static_regex(r"\bAKIA[0-9A-Z]{16}\b")),
+            (
+                "secret/github",
+                compile_static_regex(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"),
+            ),
+            (
+                "secret/db-uri",
+                compile_static_regex(
+                    r"(postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis)://[^/\s:@]+:[^/\s@]+@",
+                ),
+            ),
+            (
+                "secret/jwt",
+                compile_static_regex(
+                    r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b",
+                ),
+            ),
+        ]
+    })
+}
+
 fn count_assertions(lines: &[crate::diff::DiffLine]) -> usize {
-    let assert_re = Regex::new(ASSERT_PATTERN).unwrap();
+    let re = assert_re();
     lines
         .iter()
         .filter(|l| {
             let trimmed = l.content.trim();
-            !trimmed.starts_with("//") && !trimmed.starts_with('#') && assert_re.is_match(trimmed)
+            !trimmed.starts_with("//") && !trimmed.starts_with('#') && re.is_match(trimmed)
         })
         .count()
 }
 
 pub fn analyze_diff(files: &[FileDiff], repo_root: &Path) -> (Vec<Finding>, Vec<BlastEntry>) {
     analyze_diff_with_options(files, repo_root, &AnalyzeOptions::default())
+}
+
+#[derive(Default)]
+struct FileAnalysisResult {
+    findings: Vec<Finding>,
+    changed_symbols: Vec<(String, String)>,
+    breaking_events: Vec<BreakingEvent>,
+    new_public_symbols: Vec<(String, String, usize)>,
+    body_fingerprints: Vec<BodyFingerprint>,
+    modified_symbols: Vec<String>,
+    modified_modules: Vec<String>,
+}
+
+fn analyze_single_file(
+    f: &FileDiff,
+    is_test: bool,
+    repo_root: &Path,
+    opts: &AnalyzeOptions,
+    git_blobs: &HashMap<(String, String), String>,
+    diff_ctx: Option<&DiffContext>,
+    parser: &mut Parser,
+) -> FileAnalysisResult {
+    let mut res = FileAnalysisResult::default();
+    let lang = detect_lang(&f.path);
+
+    if !is_test && lang.is_some() {
+        if let Some(stem) = Path::new(&f.path).file_stem().and_then(|s| s.to_str()) {
+            if stem.len() >= 2 && stem != "mod" && stem != "index" && stem != "__init__" {
+                res.modified_modules.push(stem.to_string());
+            }
+        }
+    }
+
+    // 1. Test Theater: assertion removal / weakening in test files
+    if is_test {
+        let removed_asserts = count_assertions(&f.removed);
+        let added_asserts = count_assertions(&f.added);
+        if removed_asserts > 0 && added_asserts < removed_asserts {
+            let first_line = f.removed.first().map(|l| l.line_no).unwrap_or(1);
+            res.findings.push(Finding {
+                severity: Severity::Blocker,
+                category: Category::TestTheater,
+                file: f.path.clone(),
+                line: first_line,
+                rule: "test-theater/assertions-removed".into(),
+                message: format!(
+                    "Test assertions reduced (-{} removed, +{} added)",
+                    removed_asserts, added_asserts
+                ),
+            });
+        }
+    }
+
+    let mut added_lines_sorted: Vec<usize> = f.added.iter().map(|l| l.line_no).collect();
+    added_lines_sorted.sort_unstable();
+    added_lines_sorted.dedup();
+
+    // Pre-read post-change file content ONLY for supported code languages so non-code
+    // files (.md, .css, .yml, images, etc.) never incur unnecessary disk/git/AST work.
+    let disk_source: Option<std::borrow::Cow<'_, str>> = if !f.is_deleted && lang.is_some() {
+        opts.head_ref
+            .as_deref()
+            .and_then(|head| git_blobs.get(&(head.to_string(), f.path.clone())))
+            .map(|s| std::borrow::Cow::Borrowed(s.as_str()))
+            .or_else(|| {
+                fs::read_to_string(repo_root.join(&f.path))
+                    .ok()
+                    .map(std::borrow::Cow::Owned)
+            })
+    } else {
+        None
+    };
+
+    let base_source: Option<&str> = if !is_test && lang.is_some() {
+        opts.base_ref
+            .as_deref()
+            .and_then(|base| git_blobs.get(&(base.to_string(), f.path.clone())))
+            .map(String::as_str)
+    } else {
+        None
+    };
+
+    // Parse post-change file ONCE and reuse the Tree across StringMasker, signature
+    // extraction, and AST slop/test-theater analysis. For large files that also need
+    // old-AST signature extraction, parse old & new concurrently to hide single-file
+    // straggler latency.
+    let (parsed_new_tree, precomputed_old_sigs) = match (lang, disk_source.as_deref()) {
+        (Some(l), Some(src)) => {
+            if let Some(old_src) = base_source.filter(|old| !f.is_deleted && src.len() + old.len() >= 32 * 1024) {
+                let path = f.path.as_str();
+                std::thread::scope(|s| {
+                    let old_handle = s.spawn(move || {
+                        let mut old_parser = Parser::new();
+                        parse_source(&mut old_parser, l, path, old_src)
+                            .map(|old_tree| extract_signatures_from_tree(l, old_src, &old_tree))
+                    });
+                    let new_tree = parse_source(parser, l, path, src);
+                    let old_sigs = old_handle.join().ok().flatten();
+                    (new_tree, Some(old_sigs))
+                })
+            } else {
+                (parse_source(parser, l, &f.path, src), None)
+            }
+        }
+        _ => (None, None),
+    };
+
+    let string_masker = if !added_lines_sorted.is_empty() {
+        match (lang, disk_source.as_deref(), parsed_new_tree.as_ref()) {
+            (Some(l), Some(src), Some(tree)) => {
+                Some(StringMasker::from_tree(l, src, tree, &added_lines_sorted))
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    let skip_re = skip_re();
+    let trivial_assert_re = trivial_assert_re();
+    let secret_rules = secret_rules();
+    let suppress_re = suppress_re();
+    let unwrap_re = unwrap_re();
+    let todo_re = todo_re();
+    let placeholder_comment_re = placeholder_comment_re();
+    let hard_debug_re = hard_debug_re();
+    let soft_debug_re = soft_debug_re();
+
+    // 2. Per-added-line deterministic checks
+    for dl in &f.added {
+        let text = dl.content.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let is_comment =
+            text.starts_with("//") || text.starts_with('#') || text.starts_with('*');
+        // Mask string literals (including multiline strings via Tree-sitter node ranges)
+        // so rule descriptions, docstrings, raw strings, and template literals containing
+        // `"todo!()"` or `"console.log(1)"` do not trigger false positives.
+        let line_is_test = is_test
+            || string_masker
+                .as_ref()
+                .is_some_and(|m| m.is_rust_test_line(dl.line_no));
+        let code_with_comments = string_masker
+            .as_ref()
+            .and_then(|m| m.mask_line(dl.line_no, &dl.content))
+            .unwrap_or_else(|| strip_string_literals(text));
+        let code_only = string_masker
+            .as_ref()
+            .and_then(|m| m.mask_code_only(dl.line_no, &dl.content))
+            .unwrap_or_else(|| strip_inline_comment(lang, &code_with_comments));
+
+        if line_is_test && skip_re.is_match(&code_only) {
+            res.findings.push(Finding {
+                severity: Severity::Blocker,
+                category: Category::TestTheater,
+                file: f.path.clone(),
+                line: dl.line_no,
+                rule: "test-theater/skipped-test".into(),
+                message: "Test skipped/ignored in diff".into(),
+            });
+        }
+
+        if line_is_test && trivial_assert_re.is_match(&code_only) {
+            res.findings.push(Finding {
+                severity: Severity::Blocker,
+                category: Category::TestTheater,
+                file: f.path.clone(),
+                line: dl.line_no,
+                rule: "test-theater/trivial-assertion".into(),
+                message: "Trivial tautology assertion (always passes)".into(),
+            });
+        }
+
+        // Secrets live inside string literals, so match against raw `text`.
+        for (rule_name, re) in secret_rules {
+            if re.is_match(text) {
+                res.findings.push(Finding {
+                    severity: Severity::Blocker,
+                    category: Category::SecretLeak,
+                    file: f.path.clone(),
+                    line: dl.line_no,
+                    rule: (*rule_name).into(),
+                    message: "Hardcoded secret/credential pattern introduced".into(),
+                });
+            }
+        }
+
+        if lang.is_some() && !is_comment && hard_debug_re.is_match(&code_only) {
+            res.findings.push(Finding {
+                severity: Severity::Warning,
+                category: Category::SilentSlop,
+                file: f.path.clone(),
+                line: dl.line_no,
+                rule: "slop/debug-leftover".into(),
+                message: "Interactive debugger breakpoint leftover".into(),
+            });
+        }
+
+        if lang.is_some() && !line_is_test {
+            if !is_comment && soft_debug_re.is_match(&code_only) {
+                res.findings.push(Finding {
+                    severity: Severity::Warning,
+                    category: Category::SilentSlop,
+                    file: f.path.clone(),
+                    line: dl.line_no,
+                    rule: "slop/debug-leftover".into(),
+                    message: "Debug print leftover (console.log / dbg! / fmt.Println)".into(),
+                });
+            }
+            if suppress_re.is_match(&code_with_comments) {
+                res.findings.push(Finding {
+                    severity: Severity::Warning,
+                    category: Category::SilentSlop,
+                    file: f.path.clone(),
+                    line: dl.line_no,
+                    rule: "slop/type-suppression".into(),
+                    message: "Compiler/type-checker suppression added".into(),
+                });
+            }
+            if lang == Some(Lang::Rust) && unwrap_re.is_match(&code_only) && !is_comment {
+                res.findings.push(Finding {
+                    severity: Severity::Warning,
+                    category: Category::SilentSlop,
+                    file: f.path.clone(),
+                    line: dl.line_no,
+                    rule: "slop/rust-unwrap".into(),
+                    message: "New .unwrap()/.expect() panic hazard introduced".into(),
+                });
+            }
+            if (todo_re.is_match(&code_only) && !is_comment)
+                || placeholder_comment_re.is_match(&code_with_comments)
+            {
+                res.findings.push(Finding {
+                    severity: Severity::Warning,
+                    category: Category::SilentSlop,
+                    file: f.path.clone(),
+                    line: dl.line_no,
+                    rule: "slop/unfinished-stub".into(),
+                    message: "Unfinished stub or placeholder implementation".into(),
+                });
+            }
+        }
+    }
+
+    // 3. Tree-sitter AST checks on the actual file on disk (or deleted file's old AST)
+    let Some(lang) = lang else {
+        return res;
+    };
+
+    if f.is_deleted {
+        if !is_test {
+            let old_src: Option<std::borrow::Cow<'_, str>> = opts
+                .base_ref
+                .as_deref()
+                .and_then(|base| git_blobs.get(&(base.to_string(), f.path.clone())))
+                .map(|s| std::borrow::Cow::Borrowed(s.as_str()))
+                .or_else(|| {
+                    if f.removed.is_empty() {
+                        None
+                    } else {
+                        Some(std::borrow::Cow::Owned(
+                            f.removed
+                                .iter()
+                                .map(|l| l.content.as_str())
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        ))
+                    }
+                });
+            if let Some(src) = old_src.as_deref() {
+                if let Some(old_tree) = parse_source(parser, lang, &f.path, src) {
+                    let old_sigs = extract_signatures_from_tree(lang, src, &old_tree);
+                    for old_sig in old_sigs.values() {
+                        if !old_sig.is_public || is_generic_symbol_name(&old_sig.name) {
+                            continue;
+                        }
+                        res.changed_symbols
+                            .push((f.path.clone(), old_sig.name.clone()));
+                        res.modified_symbols.push(old_sig.name.clone());
+                        res.breaking_events.push(BreakingEvent {
+                            file: f.path.clone(),
+                            symbol: old_sig.name.clone(),
+                            line: old_sig.line.max(1),
+                            removed: true,
+                            detail: format!(
+                                "Public symbol `{}` was removed (file deleted)",
+                                old_sig.name
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        return res;
+    }
+
+    let (Some(source), Some(new_tree)) = (disk_source.as_deref(), parsed_new_tree.as_ref()) else {
+        return res;
+    };
+
+    // 3a. Old-AST vs New-AST signature diff (only for non-test files)
+    if !is_test {
+        let old_sigs = match precomputed_old_sigs {
+            Some(sigs) => sigs,
+            None => base_source.and_then(|old_src| {
+                parse_source(parser, lang, &f.path, old_src)
+                    .map(|old_tree| extract_signatures_from_tree(lang, old_src, &old_tree))
+            }),
+        };
+
+        let new_sigs = extract_signatures_from_tree(lang, source, new_tree);
+
+        if let Some(ref old_map) = old_sigs {
+            for (sig_key, old_sig) in old_map {
+                if !old_sig.is_public || is_generic_symbol_name(&old_sig.name) {
+                    continue;
+                }
+                match new_sigs.get(sig_key) {
+                    None => {
+                        res.changed_symbols
+                            .push((f.path.clone(), old_sig.name.clone()));
+                        res.modified_symbols.push(old_sig.name.clone());
+                        res.breaking_events.push(BreakingEvent {
+                            file: f.path.clone(),
+                            symbol: old_sig.name.clone(),
+                            line: 1,
+                            removed: true,
+                            detail: format!("Public symbol `{}` was removed", old_sig.name),
+                        });
+                    }
+                    Some(new_sig) => {
+                        if let Some(diff_desc) = detect_breaking_signature(old_sig, new_sig) {
+                            res.changed_symbols
+                                .push((f.path.clone(), new_sig.name.clone()));
+                            res.modified_symbols.push(new_sig.name.clone());
+                            res.breaking_events.push(BreakingEvent {
+                                file: f.path.clone(),
+                                symbol: new_sig.name.clone(),
+                                line: new_sig.line,
+                                removed: false,
+                                detail: diff_desc,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Collect newly added public/exported functions for untested-new-public check
+        for (sig_key, sig) in &new_sigs {
+            if !sig.is_public || is_generic_symbol_name(&sig.name) {
+                continue;
+            }
+            let line_added = added_lines_sorted.binary_search(&sig.line).is_ok();
+            let is_newly_added = match old_sigs {
+                Some(ref old_map) => !old_map.contains_key(sig_key) && line_added,
+                None => line_added,
+            };
+            if is_newly_added {
+                res.new_public_symbols
+                    .push((f.path.clone(), sig.name.clone(), sig.line));
+            }
+        }
+    }
+
+    if !added_lines_sorted.is_empty() {
+        analyze_ast_from_tree(
+            &f.path,
+            lang,
+            source,
+            new_tree,
+            is_test,
+            &added_lines_sorted,
+            diff_ctx,
+            &mut res,
+        );
+    }
+
+    res
+}
+
+fn run_file_batch(
+    batch: &[&FileDiff],
+    is_test: bool,
+    repo_root: &Path,
+    opts: &AnalyzeOptions,
+    git_blobs: &HashMap<(String, String), String>,
+    diff_ctx: Option<&DiffContext>,
+) -> Vec<FileAnalysisResult> {
+    if batch.is_empty() {
+        return Vec::new();
+    }
+    if batch.len() == 1 {
+        let mut parser = Parser::new();
+        return vec![analyze_single_file(
+            batch[0],
+            is_test,
+            repo_root,
+            opts,
+            git_blobs,
+            diff_ctx,
+            &mut parser,
+        )];
+    }
+
+    // Schedule largest files first (Longest Processing Time first) so big files
+    // start immediately on idle cores instead of creating a tail straggler, while
+    // storing results by original index to keep output 100% deterministic.
+    let mut work_order: Vec<(usize, usize)> = batch
+        .iter()
+        .enumerate()
+        .map(|(idx, f)| {
+            let head_len = opts
+                .head_ref
+                .as_deref()
+                .and_then(|h| git_blobs.get(&(h.to_string(), f.path.clone())))
+                .map_or(0, String::len);
+            let base_len = opts
+                .base_ref
+                .as_deref()
+                .and_then(|b| git_blobs.get(&(b.to_string(), f.path.clone())))
+                .map_or(0, String::len);
+            let weight = head_len + base_len + f.added.len() * 64;
+            (idx, weight)
+        })
+        .collect();
+    work_order.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(batch.len());
+
+    let next_pos = AtomicUsize::new(0);
+    let mut slots: Vec<std::sync::Mutex<Option<FileAnalysisResult>>> =
+        (0..batch.len()).map(|_| std::sync::Mutex::new(None)).collect();
+
+    std::thread::scope(|s| {
+        for _ in 0..num_threads {
+            let next_pos = &next_pos;
+            let work_order = &work_order;
+            let slots = &slots;
+            s.spawn(move || {
+                let mut parser = Parser::new();
+                loop {
+                    let pos = next_pos.fetch_add(1, Ordering::Relaxed);
+                    if pos >= work_order.len() {
+                        break;
+                    }
+                    let idx = work_order[pos].0;
+                    let result = analyze_single_file(
+                        batch[idx],
+                        is_test,
+                        repo_root,
+                        opts,
+                        git_blobs,
+                        diff_ctx,
+                        &mut parser,
+                    );
+                    if let Ok(mut guard) = slots[idx].lock() {
+                        *guard = Some(result);
+                    }
+                }
+            });
+        }
+    });
+
+    slots
+        .iter_mut()
+        .map(|slot| match slot.get_mut() {
+            Ok(inner) => inner.take().unwrap_or_default(),
+            Err(_) => FileAnalysisResult::default(),
+        })
+        .collect()
 }
 
 pub fn analyze_diff_with_options(
@@ -176,359 +777,75 @@ pub fn analyze_diff_with_options(
     let mut body_fingerprints: Vec<BodyFingerprint> = Vec::new();
     let mut diff_ctx = DiffContext::default();
 
-    let modified_files: BTreeSet<String> = files
-        .iter()
-        .filter(|f| !opts.config.is_ignored(&f.path))
-        .map(|f| f.path.replace('\\', "/"))
-        .collect();
+    let mut prod_files: Vec<&FileDiff> = Vec::new();
+    let mut test_files: Vec<&FileDiff> = Vec::new();
+    let mut modified_files: BTreeSet<String> = BTreeSet::new();
+    let mut extra_scan_paths: Vec<String> = Vec::new();
+    let mut blob_specs: Vec<(String, String)> = Vec::new();
 
-    let skip_re = Regex::new(
-        r"(\.skip\s*\(|\bxit\s*\(|\bxdescribe\s*\(|@pytest\.mark\.skip|@unittest\.skip|#\[ignore\b|t\.Skip\s*\()",
-    )
-    .unwrap();
-    let trivial_assert_re = Regex::new(
-        r"(\bassert\s+True\b|\bassert\s+1\s*==\s*1\b|\bassert\s+not\s+False\b|\bexpect\s*\(\s*true\s*\)\s*\.toBe\s*\(\s*true\s*\)|\bexpect\s*\(\s*true\s*\)\s*\.toBeTruthy\s*\(\s*\)|\bexpect\s*\(\s*1\s*\)\s*\.toBe\s*\(\s*1\s*\)|\bassert!\s*\(\s*true\s*\)|\bassert_eq!\s*\(\s*1\s*,\s*1\s*\))",
-    )
-    .unwrap();
-    let secret_rules: Vec<(&str, Regex)> = vec![
-        (
-            "secret/stripe",
-            Regex::new(r"\bsk_(?:live|test)_[A-Za-z0-9]{16,}\b").unwrap(),
-        ),
-        (
-            "secret/aws",
-            Regex::new(r"\bAKIA[0-9A-Z]{16}\b").unwrap(),
-        ),
-        (
-            "secret/github",
-            Regex::new(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b").unwrap(),
-        ),
-        (
-            "secret/db-uri",
-            Regex::new(r"(postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis)://[^/\s:@]+:[^/\s@]+@")
-                .unwrap(),
-        ),
-        (
-            "secret/jwt",
-            Regex::new(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")
-                .unwrap(),
-        ),
-    ];
-    let suppress_re =
-        Regex::new(r"(@ts-ignore|@ts-nocheck|#\s*type:\s*ignore|#\[allow\(warnings\)\])").unwrap();
-    let unwrap_re = Regex::new(r"\.(unwrap|expect)\s*\(").unwrap();
-    let todo_re =
-        Regex::new(r"(\btodo!\s*\(|\bunimplemented!\s*\(|\bNotImplementedError\b)").unwrap();
-    let placeholder_comment_re = Regex::new(
-        r"(?i)(?://|#|/\*)\s*(?:TODO\s*:?\s*(?:implement|fill|add|complete|fix|stub)|implement\s+(?:logic|this|here|me|later)|placeholder\s+implementation)",
-    )
-    .unwrap();
-    let hard_debug_re =
-        Regex::new(r"(\bbreakpoint\s*\(|\bpdb\.set_trace\s*\(|\bipdb\.set_trace\s*\(|\bdebugger\s*;)").unwrap();
-    let soft_debug_re =
-        Regex::new(r"(\bconsole\.(log|debug)\s*\(|\bdbg!\s*\(|\bfmt\.Println\s*\()").unwrap();
+    for f in files {
+        if opts.config.is_ignored(&f.path) {
+            continue;
+        }
+        let norm_path = f.path.replace('\\', "/");
+        if !f.is_deleted {
+            extra_scan_paths.push(norm_path.clone());
+        }
+        modified_files.insert(norm_path);
 
-    // Process non-test files first so diff_ctx has all modified production symbols & modules
-    // before analyzing test files for diff-aware mock-testing-mock detection.
-    let ordered_files: Vec<&FileDiff> = files
-        .iter()
-        .filter(|f| !opts.config.is_ignored(&f.path) && !f.is_test_file())
-        .chain(
-            files
-                .iter()
-                .filter(|f| !opts.config.is_ignored(&f.path) && f.is_test_file()),
-        )
-        .collect();
-
-    for f in ordered_files {
         let is_test = f.is_test_file();
-        let lang = detect_lang(&f.path);
-
-        if !is_test && lang.is_some() {
-            if let Some(stem) = Path::new(&f.path).file_stem().and_then(|s| s.to_str()) {
-                if stem.len() >= 2 && stem != "mod" && stem != "index" && stem != "__init__" {
-                    diff_ctx.modified_modules.insert(stem.to_string());
+        let is_code = detect_lang(&f.path).is_some();
+        if is_code {
+            if !f.is_deleted {
+                if let Some(ref head) = opts.head_ref {
+                    blob_specs.push((head.clone(), f.path.clone()));
                 }
             }
-        }
-
-        // 1. Test Theater: assertion removal / weakening in test files
-        if is_test {
-            let removed_asserts = count_assertions(&f.removed);
-            let added_asserts = count_assertions(&f.added);
-            if removed_asserts > 0 && added_asserts < removed_asserts {
-                let first_line = f.removed.first().map(|l| l.line_no).unwrap_or(1);
-                findings.push(Finding {
-                    severity: Severity::Blocker,
-                    category: Category::TestTheater,
-                    file: f.path.clone(),
-                    line: first_line,
-                    rule: "test-theater/assertions-removed".into(),
-                    message: format!(
-                        "Test assertions reduced (-{} removed, +{} added)",
-                        removed_asserts, added_asserts
-                    ),
-                });
-            }
-        }
-
-        // Pre-read post-change file content (from `head_ref` / git index when scanning
-        // a commit range or `--staged`, otherwise from the working tree on disk) so we
-        // can build a Tree-sitter string masker for multiline string literals before
-        // running line-based slop checks.
-        let disk_source = if !f.is_deleted {
-            opts.head_ref
-                .as_deref()
-                .and_then(|head| git_show_file(repo_root, head, &f.path))
-                .or_else(|| fs::read_to_string(repo_root.join(&f.path)).ok())
-        } else {
-            None
-        };
-        let string_masker = match (lang, disk_source.as_deref()) {
-            (Some(l), Some(src)) => StringMasker::new(l, src),
-            _ => None,
-        };
-
-        // 2. Per-added-line deterministic checks
-        for dl in &f.added {
-            let text = dl.content.trim();
-            if text.is_empty() {
-                continue;
-            }
-            let is_comment =
-                text.starts_with("//") || text.starts_with('#') || text.starts_with('*');
-            // Mask string literals (including multiline strings via Tree-sitter node ranges)
-            // so rule descriptions, docstrings, raw strings, and template literals containing
-            // `"todo!()"` or `"console.log(1)"` do not trigger false positives.
-            let line_is_test = is_test
-                || string_masker
-                    .as_ref()
-                    .is_some_and(|m| m.is_rust_test_line(dl.line_no));
-            let code_with_comments = string_masker
-                .as_ref()
-                .and_then(|m| m.mask_line(dl.line_no, &dl.content))
-                .unwrap_or_else(|| strip_string_literals(text));
-            let code_only = string_masker
-                .as_ref()
-                .and_then(|m| m.mask_code_only(dl.line_no, &dl.content))
-                .unwrap_or_else(|| strip_inline_comment(lang, &code_with_comments));
-
-            if line_is_test && skip_re.is_match(&code_only) {
-                findings.push(Finding {
-                    severity: Severity::Blocker,
-                    category: Category::TestTheater,
-                    file: f.path.clone(),
-                    line: dl.line_no,
-                    rule: "test-theater/skipped-test".into(),
-                    message: "Test skipped/ignored in diff".into(),
-                });
-            }
-
-            if line_is_test && trivial_assert_re.is_match(&code_only) {
-                findings.push(Finding {
-                    severity: Severity::Blocker,
-                    category: Category::TestTheater,
-                    file: f.path.clone(),
-                    line: dl.line_no,
-                    rule: "test-theater/trivial-assertion".into(),
-                    message: "Trivial tautology assertion (always passes)".into(),
-                });
-            }
-
-            // Secrets live inside string literals, so match against raw `text`.
-            for (rule_name, re) in &secret_rules {
-                if re.is_match(text) {
-                    findings.push(Finding {
-                        severity: Severity::Blocker,
-                        category: Category::SecretLeak,
-                        file: f.path.clone(),
-                        line: dl.line_no,
-                        rule: (*rule_name).into(),
-                        message: "Hardcoded secret/credential pattern introduced".into(),
-                    });
-                }
-            }
-
-            if lang.is_some() && !is_comment && hard_debug_re.is_match(&code_only) {
-                findings.push(Finding {
-                    severity: Severity::Warning,
-                    category: Category::SilentSlop,
-                    file: f.path.clone(),
-                    line: dl.line_no,
-                    rule: "slop/debug-leftover".into(),
-                    message: "Interactive debugger breakpoint leftover".into(),
-                });
-            }
-
-            if lang.is_some() && !line_is_test {
-                if !is_comment && soft_debug_re.is_match(&code_only) {
-                    findings.push(Finding {
-                        severity: Severity::Warning,
-                        category: Category::SilentSlop,
-                        file: f.path.clone(),
-                        line: dl.line_no,
-                        rule: "slop/debug-leftover".into(),
-                        message: "Debug print leftover (console.log / dbg! / fmt.Println)".into(),
-                    });
-                }
-                if suppress_re.is_match(&code_with_comments) {
-                    findings.push(Finding {
-                        severity: Severity::Warning,
-                        category: Category::SilentSlop,
-                        file: f.path.clone(),
-                        line: dl.line_no,
-                        rule: "slop/type-suppression".into(),
-                        message: "Compiler/type-checker suppression added".into(),
-                    });
-                }
-                if lang == Some(Lang::Rust) && unwrap_re.is_match(&code_only) && !is_comment {
-                    findings.push(Finding {
-                        severity: Severity::Warning,
-                        category: Category::SilentSlop,
-                        file: f.path.clone(),
-                        line: dl.line_no,
-                        rule: "slop/rust-unwrap".into(),
-                        message: "New .unwrap()/.expect() panic hazard introduced".into(),
-                    });
-                }
-                if (todo_re.is_match(&code_only) && !is_comment)
-                    || placeholder_comment_re.is_match(&code_with_comments)
-                {
-                    findings.push(Finding {
-                        severity: Severity::Warning,
-                        category: Category::SilentSlop,
-                        file: f.path.clone(),
-                        line: dl.line_no,
-                        rule: "slop/unfinished-stub".into(),
-                        message: "Unfinished stub or placeholder implementation".into(),
-                    });
-                }
-            }
-        }
-
-        // 3. Tree-sitter AST checks on the actual file on disk (or deleted file's old AST)
-        let Some(lang) = lang else { continue };
-
-        if f.is_deleted {
             if !is_test {
-                let old_src = opts
-                    .base_ref
-                    .as_deref()
-                    .and_then(|base| git_show_file(repo_root, base, &f.path))
-                    .or_else(|| {
-                        if f.removed.is_empty() {
-                            None
-                        } else {
-                            Some(
-                                f.removed
-                                    .iter()
-                                    .map(|l| l.content.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join("\n"),
-                            )
-                        }
-                    });
-                if let Some(src) = old_src {
-                    let old_sigs = extract_signatures(lang, &src);
-                    for old_sig in old_sigs.values() {
-                        if !old_sig.is_public || is_generic_symbol_name(&old_sig.name) {
-                            continue;
-                        }
-                        changed_symbols.push((f.path.clone(), old_sig.name.clone()));
-                        diff_ctx.modified_symbols.insert(old_sig.name.clone());
-                        breaking_events.push(BreakingEvent {
-                            file: f.path.clone(),
-                            symbol: old_sig.name.clone(),
-                            line: old_sig.line.max(1),
-                            removed: true,
-                            detail: format!(
-                                "Public symbol `{}` was removed (file deleted)",
-                                old_sig.name
-                            ),
-                        });
-                    }
-                }
-            }
-            continue;
-        }
-
-        let Some(source) = disk_source else {
-            continue;
-        };
-        let added_lines: BTreeSet<usize> = f.added.iter().map(|l| l.line_no).collect();
-
-        // 3a. Old-AST vs New-AST signature diff (when base_ref is available)
-        let old_sigs = opts
-            .base_ref
-            .as_deref()
-            .and_then(|base| git_show_file(repo_root, base, &f.path))
-            .map(|old_src| extract_signatures(lang, &old_src));
-
-        let new_sigs = extract_signatures(lang, &source);
-
-        if !is_test {
-            if let Some(ref old_map) = old_sigs {
-                for (sig_key, old_sig) in old_map {
-                    if !old_sig.is_public || is_generic_symbol_name(&old_sig.name) {
-                        continue;
-                    }
-                    match new_sigs.get(sig_key) {
-                        None => {
-                            changed_symbols.push((f.path.clone(), old_sig.name.clone()));
-                            diff_ctx.modified_symbols.insert(old_sig.name.clone());
-                            breaking_events.push(BreakingEvent {
-                                file: f.path.clone(),
-                                symbol: old_sig.name.clone(),
-                                line: 1,
-                                removed: true,
-                                detail: format!("Public symbol `{}` was removed", old_sig.name),
-                            });
-                        }
-                        Some(new_sig) => {
-                            if let Some(diff_desc) = detect_breaking_signature(old_sig, new_sig) {
-                                changed_symbols.push((f.path.clone(), new_sig.name.clone()));
-                                diff_ctx.modified_symbols.insert(new_sig.name.clone());
-                                breaking_events.push(BreakingEvent {
-                                    file: f.path.clone(),
-                                    symbol: new_sig.name.clone(),
-                                    line: new_sig.line,
-                                    removed: false,
-                                    detail: diff_desc,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Collect newly added public/exported functions for untested-new-public check
-            for (sig_key, sig) in &new_sigs {
-                if !sig.is_public || is_generic_symbol_name(&sig.name) {
-                    continue;
-                }
-                let is_newly_added = match old_sigs {
-                    Some(ref old_map) => {
-                        !old_map.contains_key(sig_key) && added_lines.contains(&sig.line)
-                    }
-                    None => added_lines.contains(&sig.line),
-                };
-                if is_newly_added {
-                    new_public_symbols.push((f.path.clone(), sig.name.clone(), sig.line));
+                if let Some(ref base) = opts.base_ref {
+                    blob_specs.push((base.clone(), f.path.clone()));
                 }
             }
         }
 
-        analyze_ast(
-            &f.path,
-            lang,
-            &source,
-            is_test,
-            &added_lines,
-            &mut findings,
-            &mut changed_symbols,
-            &mut body_fingerprints,
-            &mut diff_ctx,
-        );
+        if is_test {
+            test_files.push(f);
+        } else {
+            prod_files.push(f);
+        }
+    }
+
+    // Batch-fetch all needed head/base git blobs in a single `git cat-file --batch` call.
+    let git_blobs = git_show_files_batch(repo_root, &blob_specs);
+
+    // Phase A: Analyze non-test files in parallel so diff_ctx has all modified production
+    // symbols & modules before analyzing test files for diff-aware mock-testing-mock detection.
+    let prod_results = run_file_batch(&prod_files, false, repo_root, opts, &git_blobs, None);
+    for res in prod_results {
+        findings.extend(res.findings);
+        changed_symbols.extend(res.changed_symbols);
+        breaking_events.extend(res.breaking_events);
+        new_public_symbols.extend(res.new_public_symbols);
+        body_fingerprints.extend(res.body_fingerprints);
+        for sym in res.modified_symbols {
+            diff_ctx.modified_symbols.insert(sym);
+        }
+        for module in res.modified_modules {
+            diff_ctx.modified_modules.insert(module);
+        }
+    }
+
+    // Phase B: Analyze test files in parallel using read-only diff_ctx.
+    let test_results = run_file_batch(
+        &test_files,
+        true,
+        repo_root,
+        opts,
+        &git_blobs,
+        Some(&diff_ctx),
+    );
+    for res in test_results {
+        findings.extend(res.findings);
     }
 
     // 4. Duplicate function/block detection via AST structural hashing across the PR
@@ -540,6 +857,7 @@ pub fn analyze_diff_with_options(
         &changed_symbols,
         &new_public_symbols,
         &opts.config,
+        &extra_scan_paths,
     );
 
     // Enrich blast radius and emit conservative (Warning) breaking change findings
@@ -731,11 +1049,7 @@ struct StringMasker<'a> {
 }
 
 impl<'a> StringMasker<'a> {
-    fn new(lang: Lang, source: &'a str) -> Option<Self> {
-        let mut parser = Parser::new();
-        parser.set_language(&ts_language(lang)).ok()?;
-        let tree = parser.parse(source, None)?;
-
+    fn from_tree(lang: Lang, source: &'a str, tree: &Tree, added_lines_sorted: &[usize]) -> Self {
         let mut line_spans = Vec::new();
         let mut offset = 0usize;
         for raw_line in source.split('\n') {
@@ -747,28 +1061,32 @@ impl<'a> StringMasker<'a> {
         }
 
         let mut string_ranges = Vec::new();
-        collect_string_ranges(lang, tree.root_node(), &mut string_ranges);
-        string_ranges.sort_unstable();
-
         let mut comment_ranges = Vec::new();
-        collect_comment_ranges(tree.root_node(), &mut comment_ranges);
+        let mut rust_test_lines = Vec::new();
+        collect_masker_ranges(
+            lang,
+            tree.root_node(),
+            source.as_bytes(),
+            added_lines_sorted,
+            &mut string_ranges,
+            &mut comment_ranges,
+            &mut rust_test_lines,
+        );
 
-        let mut string_and_comment_ranges = string_ranges.clone();
-        string_and_comment_ranges.extend(comment_ranges);
+        string_ranges.sort_unstable();
+        let mut string_and_comment_ranges =
+            Vec::with_capacity(string_ranges.len() + comment_ranges.len());
+        string_and_comment_ranges.extend_from_slice(&string_ranges);
+        string_and_comment_ranges.extend_from_slice(&comment_ranges);
         string_and_comment_ranges.sort_unstable();
 
-        let mut rust_test_lines = Vec::new();
-        if lang == Lang::Rust {
-            collect_rust_test_line_ranges(tree.root_node(), source.as_bytes(), &mut rust_test_lines);
-        }
-
-        Some(Self {
+        Self {
             source,
             line_spans,
             string_ranges,
             string_and_comment_ranges,
             rust_test_lines,
-        })
+        }
     }
 
     fn is_rust_test_line(&self, line_no: usize) -> bool {
@@ -823,15 +1141,79 @@ impl<'a> StringMasker<'a> {
     }
 }
 
-fn collect_comment_ranges(node: Node, out: &mut Vec<(usize, usize)>) {
-    if matches!(node.kind(), "comment" | "line_comment" | "block_comment") {
-        out.push((node.start_byte(), node.end_byte()));
-        return;
+fn is_string_node_kind(lang: Lang, kind: &str) -> bool {
+    match lang {
+        Lang::Python => kind == "string",
+        Lang::Rust => kind == "string_literal" || kind == "raw_string_literal",
+        Lang::JavaScript | Lang::TypeScript => kind == "string" || kind == "template_string",
+        Lang::Go => kind == "interpreted_string_literal" || kind == "raw_string_literal",
     }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_comment_ranges(child, out);
-    }
+}
+
+fn collect_masker_ranges(
+    lang: Lang,
+    root: Node,
+    bytes: &[u8],
+    added_lines_sorted: &[usize],
+    string_ranges: &mut Vec<(usize, usize)>,
+    comment_ranges: &mut Vec<(usize, usize)>,
+    rust_test_lines: &mut Vec<(usize, usize)>,
+) {
+    let supports_interp = matches!(lang, Lang::Python | Lang::JavaScript | Lang::TypeScript);
+    walk_cursor(root, |node| {
+        let start_line = node.start_position().row + 1;
+        let end_line = node.end_position().row + 1;
+        if !range_touches_lines(added_lines_sorted, start_line, end_line) {
+            return false;
+        }
+        let kind = node.kind();
+        if matches!(kind, "comment" | "line_comment" | "block_comment") {
+            comment_ranges.push((node.start_byte(), node.end_byte()));
+            return false;
+        }
+        if is_string_node_kind(lang, kind) {
+            if supports_interp {
+                let mut interps = Vec::new();
+                let mut c = node.walk();
+                for child in node.children(&mut c) {
+                    if matches!(child.kind(), "interpolation" | "template_substitution") {
+                        interps.push(child);
+                    }
+                }
+                if !interps.is_empty() {
+                    let mut cur = node.start_byte();
+                    for interp in interps {
+                        if interp.start_byte() > cur {
+                            string_ranges.push((cur, interp.start_byte()));
+                        }
+                        collect_masker_ranges(
+                            lang,
+                            interp,
+                            bytes,
+                            added_lines_sorted,
+                            string_ranges,
+                            comment_ranges,
+                            rust_test_lines,
+                        );
+                        cur = interp.end_byte();
+                    }
+                    if node.end_byte() > cur {
+                        string_ranges.push((cur, node.end_byte()));
+                    }
+                    return false;
+                }
+            }
+            string_ranges.push((node.start_byte(), node.end_byte()));
+            return false;
+        }
+        if lang == Lang::Rust
+            && ((kind == "mod_item" && has_rust_cfg_test_attr(node, bytes))
+                || (kind == "function_item" && has_rust_test_attr(node, bytes)))
+        {
+            rust_test_lines.push((start_line, end_line));
+        }
+        true
+    });
 }
 
 fn has_rust_cfg_test_attr(node: Node, bytes: &[u8]) -> bool {
@@ -840,7 +1222,10 @@ fn has_rust_cfg_test_attr(node: Node, bytes: &[u8]) -> bool {
         if sib.kind() == "attribute_item" {
             let txt = sib.utf8_text(bytes).unwrap_or("");
             let compact: String = txt.chars().filter(|c| !c.is_whitespace()).collect();
-            if compact.contains("cfg(test)") || compact.contains("cfg(all(test,") || compact.contains(",test))") {
+            if compact.contains("cfg(test)")
+                || compact.contains("cfg(all(test,")
+                || compact.contains(",test))")
+            {
                 return true;
             }
             prev = sib.prev_sibling();
@@ -865,19 +1250,6 @@ fn is_inside_rust_cfg_test(node: Node, bytes: &[u8]) -> bool {
     false
 }
 
-fn collect_rust_test_line_ranges(node: Node, bytes: &[u8], out: &mut Vec<(usize, usize)>) {
-    if (node.kind() == "mod_item" && has_rust_cfg_test_attr(node, bytes))
-        || (node.kind() == "function_item" && has_rust_test_attr(node, bytes))
-    {
-        out.push((node.start_position().row + 1, node.end_position().row + 1));
-        return;
-    }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_rust_test_line_ranges(child, bytes, out);
-    }
-}
-
 fn strip_inline_comment(lang: Option<Lang>, code_with_strings_stripped: &str) -> String {
     match lang {
         Some(Lang::Python) => code_with_strings_stripped
@@ -895,49 +1267,6 @@ fn strip_inline_comment(lang: Option<Lang>, code_with_strings_stripped: &str) ->
                 .to_string()
         }
         None => code_with_strings_stripped.to_string(),
-    }
-}
-
-fn collect_string_ranges(lang: Lang, node: Node, out: &mut Vec<(usize, usize)>) {
-    let kind = node.kind();
-    let is_string = match lang {
-        Lang::Python => kind == "string",
-        Lang::Rust => kind == "string_literal" || kind == "raw_string_literal",
-        Lang::JavaScript | Lang::TypeScript => kind == "string" || kind == "template_string",
-        Lang::Go => kind == "interpreted_string_literal" || kind == "raw_string_literal",
-    };
-
-    if is_string {
-        let mut interps = Vec::new();
-        if matches!(lang, Lang::Python | Lang::JavaScript | Lang::TypeScript) {
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                if matches!(child.kind(), "interpolation" | "template_substitution") {
-                    interps.push(child);
-                }
-            }
-        }
-        if interps.is_empty() {
-            out.push((node.start_byte(), node.end_byte()));
-        } else {
-            let mut cur = node.start_byte();
-            for interp in interps {
-                if interp.start_byte() > cur {
-                    out.push((cur, interp.start_byte()));
-                }
-                collect_string_ranges(lang, interp, out);
-                cur = interp.end_byte();
-            }
-            if node.end_byte() > cur {
-                out.push((cur, node.end_byte()));
-            }
-        }
-        return;
-    }
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_string_ranges(lang, child, out);
     }
 }
 
@@ -1005,31 +1334,26 @@ fn strip_string_literals(line: &str) -> String {
     out
 }
 
-fn extract_signatures(lang: Lang, source: &str) -> BTreeMap<String, FnSignature> {
+fn extract_signatures_from_tree(
+    lang: Lang,
+    source: &str,
+    tree: &Tree,
+) -> BTreeMap<String, FnSignature> {
     let mut map = BTreeMap::new();
-    let mut parser = Parser::new();
-    if parser.set_language(&ts_language(lang)).is_err() {
-        return map;
-    }
-    let Some(tree) = parser.parse(source, None) else {
-        return map;
-    };
     let bytes = source.as_bytes();
-    let mut stack = vec![tree.root_node()];
-
-    while let Some(node) = stack.pop() {
-        if lang == Lang::Rust && node.kind() == "mod_item" && has_rust_cfg_test_attr(node, bytes) {
-            continue;
+    walk_cursor(tree.root_node(), |node| {
+        if lang == Lang::Rust
+            && node.kind() == "mod_item"
+            && has_rust_cfg_test_attr(node, bytes)
+        {
+            return false;
         }
         if let Some(sig) = extract_fn_signature(lang, node, bytes) {
             let key = scoped_signature_key(lang, node, &sig.name, bytes);
             map.entry(key).or_insert(sig);
         }
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            stack.push(child);
-        }
-    }
+        true
+    });
     map
 }
 
@@ -1202,32 +1526,22 @@ fn collapse_ws(s: &str) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn analyze_ast(
+fn analyze_ast_from_tree(
     rel_path: &str,
     lang: Lang,
     source: &str,
+    tree: &Tree,
     is_test: bool,
-    added_lines: &BTreeSet<usize>,
-    findings: &mut Vec<Finding>,
-    changed_symbols: &mut Vec<(String, String)>,
-    body_fingerprints: &mut Vec<BodyFingerprint>,
-    diff_ctx: &mut DiffContext,
+    added_lines_sorted: &[usize],
+    diff_ctx: Option<&DiffContext>,
+    res: &mut FileAnalysisResult,
 ) {
-    let mut parser = Parser::new();
-    if parser.set_language(&ts_language(lang)).is_err() {
-        return;
-    }
-    let Some(tree) = parser.parse(source, None) else {
-        return;
-    };
-
     let bytes = source.as_bytes();
-    let assert_re = Regex::new(ASSERT_PATTERN).unwrap();
-    let py_fallback_re =
-        Regex::new(r"^return\s+(None|False|True|\{\}|\[\]|''|\x22\x22|0)\s*$").unwrap();
-    let js_fallback_re =
-        Regex::new(r"^return(\s+(null|undefined|false|true|\{\}|\[\]|''|\x22\x22|0))?\s*;?$")
-            .unwrap();
+    let assert_re = assert_re();
+    let py_fallback_re = py_fallback_re();
+    let js_fallback_re = js_fallback_re();
+    let empty_ctx = DiffContext::default();
+    let active_diff_ctx = diff_ctx.unwrap_or(&empty_ctx);
 
     // Collect file-level module mocks in JS/TS tests (e.g. `jest.mock('../src/auth')`, `vi.mock('./billing')`)
     let file_mocked_modules = if is_test && matches!(lang, Lang::JavaScript | Lang::TypeScript) {
@@ -1236,28 +1550,58 @@ fn analyze_ast(
         Vec::new()
     };
 
-    let mut stack = vec![tree.root_node()];
-    while let Some(node) = stack.pop() {
-        let kind = node.kind();
+    walk_cursor(tree.root_node(), |node| {
         let start_line = node.start_position().row + 1;
         let end_line = node.end_position().row + 1;
-        let touches_diff = (start_line..=end_line).any(|l| added_lines.contains(&l));
+        if !range_touches_lines(added_lines_sorted, start_line, end_line) {
+            return false;
+        }
+
+        let kind = node.kind();
 
         // 1. Empty catch & silent fallback catch detection via AST
-        if touches_diff {
-            match (lang, kind) {
-                (Lang::Python, "except_clause") => {
-                    let txt = node.utf8_text(bytes).unwrap_or("");
-                    let body_lines: Vec<&str> = txt
-                        .lines()
-                        .skip(1)
-                        .map(|s| s.trim())
-                        .filter(|s| !s.is_empty() && !s.starts_with('#'))
-                        .collect();
-                    if body_lines.len() == 1
-                        && (body_lines[0] == "pass" || body_lines[0] == "...")
-                    {
-                        findings.push(Finding {
+        match (lang, kind) {
+            (Lang::Python, "except_clause") => {
+                let txt = node.utf8_text(bytes).unwrap_or("");
+                let body_lines: Vec<&str> = txt
+                    .lines()
+                    .skip(1)
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty() && !s.starts_with('#'))
+                    .collect();
+                if body_lines.len() == 1 && (body_lines[0] == "pass" || body_lines[0] == "...") {
+                    res.findings.push(Finding {
+                        severity: Severity::Warning,
+                        category: Category::SilentSlop,
+                        file: rel_path.to_string(),
+                        line: start_line,
+                        rule: "slop/empty-catch".into(),
+                        message: "Empty catch/except block silently swallows errors".into(),
+                    });
+                } else if body_lines.len() == 1 && py_fallback_re.is_match(body_lines[0]) {
+                    res.findings.push(Finding {
+                        severity: Severity::Warning,
+                        category: Category::SilentSlop,
+                        file: rel_path.to_string(),
+                        line: start_line,
+                        rule: "slop/silent-fallback-catch".into(),
+                        message: format!(
+                            "Except block silently returns fallback (`{}`) without logging or re-raising",
+                            body_lines[0]
+                        ),
+                    });
+                }
+            }
+            (Lang::JavaScript | Lang::TypeScript, "catch_clause") => {
+                if let Some(body) = node.child_by_field_name("body") {
+                    let named_stmts: Vec<Node> = {
+                        let mut c = body.walk();
+                        body.named_children(&mut c)
+                            .filter(|n| n.kind() != "comment")
+                            .collect()
+                    };
+                    if named_stmts.is_empty() {
+                        res.findings.push(Finding {
                             severity: Severity::Warning,
                             category: Category::SilentSlop,
                             file: rel_path.to_string(),
@@ -1265,70 +1609,36 @@ fn analyze_ast(
                             rule: "slop/empty-catch".into(),
                             message: "Empty catch/except block silently swallows errors".into(),
                         });
-                    } else if body_lines.len() == 1 && py_fallback_re.is_match(body_lines[0]) {
-                        findings.push(Finding {
-                            severity: Severity::Warning,
-                            category: Category::SilentSlop,
-                            file: rel_path.to_string(),
-                            line: start_line,
-                            rule: "slop/silent-fallback-catch".into(),
-                            message: format!(
-                                "Except block silently returns fallback (`{}`) without logging or re-raising",
-                                body_lines[0]
-                            ),
-                        });
-                    }
-                }
-                (Lang::JavaScript | Lang::TypeScript, "catch_clause") => {
-                    if let Some(body) = node.child_by_field_name("body") {
-                        let named_stmts: Vec<Node> = {
-                            let mut c = body.walk();
-                            body.named_children(&mut c)
-                                .filter(|n| n.kind() != "comment")
-                                .collect()
-                        };
-                        if named_stmts.is_empty() {
-                            findings.push(Finding {
+                    } else if named_stmts.len() == 1 && named_stmts[0].kind() == "return_statement"
+                    {
+                        let ret_txt = named_stmts[0].utf8_text(bytes).unwrap_or("").trim();
+                        if js_fallback_re.is_match(ret_txt) {
+                            res.findings.push(Finding {
                                 severity: Severity::Warning,
                                 category: Category::SilentSlop,
                                 file: rel_path.to_string(),
                                 line: start_line,
-                                rule: "slop/empty-catch".into(),
-                                message: "Empty catch/except block silently swallows errors".into(),
+                                rule: "slop/silent-fallback-catch".into(),
+                                message: format!(
+                                    "Catch block silently returns fallback (`{}`) without logging or rethrowing",
+                                    ret_txt
+                                ),
                             });
-                        } else if named_stmts.len() == 1
-                            && named_stmts[0].kind() == "return_statement"
-                        {
-                            let ret_txt = named_stmts[0].utf8_text(bytes).unwrap_or("").trim();
-                            if js_fallback_re.is_match(ret_txt) {
-                                findings.push(Finding {
-                                    severity: Severity::Warning,
-                                    category: Category::SilentSlop,
-                                    file: rel_path.to_string(),
-                                    line: start_line,
-                                    rule: "slop/silent-fallback-catch".into(),
-                                    message: format!(
-                                        "Catch block silently returns fallback (`{}`) without logging or rethrowing",
-                                        ret_txt
-                                    ),
-                                });
-                            }
                         }
                     }
                 }
-                _ => {}
             }
+            _ => {}
         }
 
         // 2. JS/TS test('...', () => { ... }) / it('...', () => { ... }) test-theater analysis
         if is_test
-            && touches_diff
             && matches!(lang, Lang::JavaScript | Lang::TypeScript)
             && kind == "call_expression"
         {
             if let Some((test_label, body_txt)) = extract_js_test_call(node, bytes) {
                 if !assert_re.is_match(body_txt) {
-                    findings.push(Finding {
+                    res.findings.push(Finding {
                         severity: Severity::Blocker,
                         category: Category::TestTheater,
                         file: rel_path.to_string(),
@@ -1342,9 +1652,9 @@ fn analyze_ast(
                     body_txt,
                     "",
                     &file_mocked_modules,
-                    diff_ctx,
+                    active_diff_ctx,
                 ) {
-                    findings.push(Finding {
+                    res.findings.push(Finding {
                         severity: Severity::Blocker,
                         category: Category::TestTheater,
                         file: rel_path.to_string(),
@@ -1361,106 +1671,102 @@ fn analyze_ast(
 
         // 3. Function/method definitions: empty tests, mock-testing-mock, stubs, blast radius, duplicate AST hash
         if let Some(name) = extract_fn_name(lang, node, bytes) {
-            if touches_diff {
-                let in_rust_inline_test =
-                    lang == Lang::Rust && is_inside_rust_cfg_test(node, bytes);
-                let node_is_test = is_test || in_rust_inline_test;
-                let is_test_fn = (is_test
-                    && (name.starts_with("test")
-                        || name.starts_with("Test")
-                        || (lang == Lang::Rust && has_rust_test_attr(node, bytes))))
-                    || (lang == Lang::Rust && has_rust_test_attr(node, bytes));
-                if is_test_fn {
-                    let txt = node.utf8_text(bytes).unwrap_or("");
-                    let decorator_src = if lang == Lang::Python {
-                        node.parent()
-                            .filter(|p| p.kind() == "decorated_definition")
-                            .and_then(|p| p.utf8_text(bytes).ok())
-                            .unwrap_or("")
-                    } else {
-                        ""
-                    };
-                    if !assert_re.is_match(txt) {
-                        findings.push(Finding {
-                            severity: Severity::Blocker,
-                            category: Category::TestTheater,
+            let in_rust_inline_test =
+                lang == Lang::Rust && is_inside_rust_cfg_test(node, bytes);
+            let node_is_test = is_test || in_rust_inline_test;
+            let is_test_fn = (is_test
+                && (name.starts_with("test")
+                    || name.starts_with("Test")
+                    || (lang == Lang::Rust && has_rust_test_attr(node, bytes))))
+                || (lang == Lang::Rust && has_rust_test_attr(node, bytes));
+            if is_test_fn {
+                let txt = node.utf8_text(bytes).unwrap_or("");
+                let decorator_src = if lang == Lang::Python {
+                    node.parent()
+                        .filter(|p| p.kind() == "decorated_definition")
+                        .and_then(|p| p.utf8_text(bytes).ok())
+                        .unwrap_or("")
+                } else {
+                    ""
+                };
+                if !assert_re.is_match(txt) {
+                    res.findings.push(Finding {
+                        severity: Severity::Blocker,
+                        category: Category::TestTheater,
+                        file: rel_path.to_string(),
+                        line: start_line,
+                        rule: "test-theater/empty-test".into(),
+                        message: format!("Test `{}` contains 0 assertions", name),
+                    });
+                } else if is_mock_testing_mock(
+                    lang,
+                    &name,
+                    txt,
+                    decorator_src,
+                    &file_mocked_modules,
+                    active_diff_ctx,
+                ) {
+                    res.findings.push(Finding {
+                        severity: Severity::Blocker,
+                        category: Category::TestTheater,
+                        file: rel_path.to_string(),
+                        line: start_line,
+                        rule: "test-theater/mock-testing-mock".into(),
+                        message: format!(
+                            "Test `{}` only asserts on mocked target/mock without verifying real behavior",
+                            name
+                        ),
+                    });
+                }
+            } else if !node_is_test {
+                res.modified_symbols.push(name.clone());
+
+                if !is_generic_symbol_name(&name) {
+                    res.changed_symbols
+                        .push((rel_path.to_string(), name.clone()));
+                }
+
+                // Placeholder / stub function body detection via AST
+                if is_placeholder_function_body(lang, node, &name, bytes) {
+                    let already_flagged = res.findings.iter().any(|f| {
+                        f.file == rel_path
+                            && f.rule == "slop/unfinished-stub"
+                            && f.line >= start_line
+                            && f.line <= end_line
+                    });
+                    if !already_flagged {
+                        res.findings.push(Finding {
+                            severity: Severity::Warning,
+                            category: Category::SilentSlop,
                             file: rel_path.to_string(),
                             line: start_line,
-                            rule: "test-theater/empty-test".into(),
-                            message: format!("Test `{}` contains 0 assertions", name),
-                        });
-                    } else if is_mock_testing_mock(
-                        lang,
-                        &name,
-                        txt,
-                        decorator_src,
-                        &file_mocked_modules,
-                        diff_ctx,
-                    ) {
-                        findings.push(Finding {
-                            severity: Severity::Blocker,
-                            category: Category::TestTheater,
-                            file: rel_path.to_string(),
-                            line: start_line,
-                            rule: "test-theater/mock-testing-mock".into(),
+                            rule: "slop/unfinished-stub".into(),
                             message: format!(
-                                "Test `{}` only asserts on mocked target/mock without verifying real behavior",
+                                "Function `{}` has an empty or placeholder stub body",
                                 name
                             ),
                         });
                     }
-                } else if !node_is_test {
-                    diff_ctx.modified_symbols.insert(name.clone());
+                }
 
-                    if !is_generic_symbol_name(&name) {
-                        changed_symbols.push((rel_path.to_string(), name.clone()));
-                    }
-
-                    // Placeholder / stub function body detection via AST
-                    if is_placeholder_function_body(lang, node, &name, bytes) {
-                        let already_flagged = findings.iter().any(|f| {
-                            f.file == rel_path
-                                && f.rule == "slop/unfinished-stub"
-                                && f.line >= start_line
-                                && f.line <= end_line
+                if let Some(body) = node.child_by_field_name("body") {
+                    let span_lines = end_line.saturating_sub(start_line) + 1;
+                    let (hash, named_count) = structural_ast_hash(body);
+                    if named_count >= 15 && span_lines >= 4 {
+                        res.body_fingerprints.push(BodyFingerprint {
+                            lang,
+                            hash,
+                            file: rel_path.to_string(),
+                            line: start_line,
+                            name,
                         });
-                        if !already_flagged {
-                            findings.push(Finding {
-                                severity: Severity::Warning,
-                                category: Category::SilentSlop,
-                                file: rel_path.to_string(),
-                                line: start_line,
-                                rule: "slop/unfinished-stub".into(),
-                                message: format!(
-                                    "Function `{}` has an empty or placeholder stub body",
-                                    name
-                                ),
-                            });
-                        }
-                    }
-
-                    if let Some(body) = node.child_by_field_name("body") {
-                        let span_lines = end_line.saturating_sub(start_line) + 1;
-                        let (hash, named_count) = structural_ast_hash(body);
-                        if named_count >= 15 && span_lines >= 4 {
-                            body_fingerprints.push(BodyFingerprint {
-                                lang,
-                                hash,
-                                file: rel_path.to_string(),
-                                line: start_line,
-                                name,
-                            });
-                        }
                     }
                 }
             }
         }
 
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            stack.push(child);
-        }
-    }
+        true
+    });
 }
 
 fn is_placeholder_function_body(lang: Lang, node: Node, name: &str, bytes: &[u8]) -> bool {
@@ -1531,7 +1837,7 @@ fn is_placeholder_function_body(lang: Lang, node: Node, name: &str, bytes: &[u8]
 }
 
 fn extract_js_file_mocked_modules(source: &str) -> Vec<String> {
-    let re = Regex::new(r#"\b(?:jest|vi)\.mock\s*\(\s*['"`]([^'"`]+)['"`]"#).unwrap();
+    let re = js_file_mock_re();
     let mut out = Vec::new();
     for cap in re.captures_iter(source) {
         if let Some(m) = cap.get(1) {
@@ -1592,10 +1898,57 @@ fn extract_js_test_call<'a>(node: Node<'a>, bytes: &'a [u8]) -> Option<(String, 
     Some((label, body_txt))
 }
 
+static_regex!(
+    py_mock_assign_re,
+    r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:unittest\.mock\.)?(?:MagicMock|Mock|AsyncMock|create_autospec|mocker\.MagicMock|mocker\.Mock|mocker\.patch|mock\.patch)\s*\("
+);
+static_regex!(
+    js_mock_assign_re,
+    r"(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?:jest\.fn|vi\.fn|sinon\.stub|sinon\.spy|jest\.spyOn|vi\.spyOn|createMock)\s*\("
+);
+static_regex!(
+    patch_as_re,
+    r"\bwith\s+.*patch\s*\([^)]*\)\s+as\s+([A-Za-z_][A-Za-z0-9_]*)"
+);
+static_regex!(
+    def_params_re,
+    r"def\s+[A-Za-z_][A-Za-z0-9_]*\s*\(([^)]*)\)"
+);
+static_regex!(
+    py_patch_target_re,
+    r#"\bpatch(?:\.object)?\s*\(\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*,\s*)?['"]([^'"]+)['"]"#
+);
+static_regex!(
+    py_monkeypatch_re,
+    r#"\bmonkeypatch\.setattr\s*\(\s*[A-Za-z_][A-Za-z0-9_.]*\s*,\s*['"]([^'"]+)['"]"#
+);
+static_regex!(
+    js_spy_re,
+    r#"\b(?:jest|vi)\.spyOn\s*\(\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*,\s*['"`]([^'"`]+)['"`]"#
+);
+static_regex!(
+    assign_call_re,
+    r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?:await\s+)?([A-Za-z_$][A-Za-z0-9_$]*)(?:\.([A-Za-z_$][A-Za-z0-9_$]*))*\s*\("
+);
+static_regex!(
+    call_re,
+    r"(?m)(?:^|[^.\w])([A-Za-z_$][A-Za-z0-9_$]*)(?:\.([A-Za-z_$][A-Za-z0-9_$]*))*\s*\("
+);
+static_regex!(
+    assert_line_re,
+    r"\b(assert|expect\(|assertEqual|assertTrue|assertFalse|assertRaises)\b|\.assert_(called|not_called|any_call)"
+);
+static_regex!(
+    mock_matcher_re,
+    r"(\.assert_(?:called|called_once|called_with|called_once_with|any_call|not_called)\b|\.(?:toHaveBeenCalled|toHaveBeenCalledWith|toHaveBeenCalledTimes|toHaveReturned|toHaveReturnedWith|calledOnce|calledWith)\b)"
+);
+static_regex!(ident_re, r"\b([A-Za-z_$][A-Za-z0-9_$]*)\b");
+
 /// High-precision, diff-aware mock-testing-mock detector:
 /// 1. Pure mock-on-mock: test creates mock variable(s), invokes them, and calls ZERO real functions.
 /// 2. Diff-aware / SUT-mocking: test mocks a symbol/module modified in the git diff (or the exact
 ///    function being tested) AND has zero behavioral assertions on real outputs/state.
+///
 /// Legitimate DI tests that mock a dependency (e.g. mailer/db/logger) while exercising real code
 /// are NOT flagged.
 fn is_mock_testing_mock(
@@ -1607,18 +1960,11 @@ fn is_mock_testing_mock(
     diff_ctx: &DiffContext,
 ) -> bool {
     let mock_assign_re = match lang {
-        Lang::Python => Regex::new(
-            r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:unittest\.mock\.)?(?:MagicMock|Mock|AsyncMock|create_autospec|mocker\.MagicMock|mocker\.Mock|mocker\.patch|mock\.patch)\s*\(",
-        )
-        .unwrap(),
-        Lang::JavaScript | Lang::TypeScript => Regex::new(
-            r"(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?:jest\.fn|vi\.fn|sinon\.stub|sinon\.spy|jest\.spyOn|vi\.spyOn|createMock)\s*\(",
-        )
-        .unwrap(),
+        Lang::Python => py_mock_assign_re(),
+        Lang::JavaScript | Lang::TypeScript => js_mock_assign_re(),
         _ => return false,
     };
-    let patch_as_re =
-        Regex::new(r"\bwith\s+.*patch\s*\([^)]*\)\s+as\s+([A-Za-z_][A-Za-z0-9_]*)").unwrap();
+    let patch_as_re = patch_as_re();
 
     let mut mock_vars: BTreeSet<String> = BTreeSet::new();
     for cap in mock_assign_re.captures_iter(test_src) {
@@ -1633,14 +1979,20 @@ fn is_mock_testing_mock(
     }
 
     // In Python, `@patch(...)` injects mock parameters into `def test_foo(mock_bar):`
-    let has_patch_decorator =
-        lang == Lang::Python && (decorator_src.contains("patch(") || decorator_src.contains("patch.object("));
+    let has_patch_decorator = lang == Lang::Python
+        && (decorator_src.contains("patch(") || decorator_src.contains("patch.object("));
     if has_patch_decorator {
-        let def_params_re = Regex::new(r"def\s+[A-Za-z_][A-Za-z0-9_]*\s*\(([^)]*)\)").unwrap();
-        if let Some(cap) = def_params_re.captures(test_src) {
+        if let Some(cap) = def_params_re().captures(test_src) {
             if let Some(params_m) = cap.get(1) {
                 for p in params_m.as_str().split(',') {
-                    let pname = p.split(':').next().unwrap_or("").split('=').next().unwrap_or("").trim();
+                    let pname = p
+                        .split(':')
+                        .next()
+                        .unwrap_or("")
+                        .split('=')
+                        .next()
+                        .unwrap_or("")
+                        .trim();
                     if !pname.is_empty() && pname != "self" && pname != "cls" {
                         mock_vars.insert(pname.to_string());
                     }
@@ -1655,16 +2007,13 @@ fn is_mock_testing_mock(
     let mut mocked_modules: BTreeSet<String> = file_mocked_modules.iter().cloned().collect();
 
     let combined_src = if decorator_src.is_empty() {
-        test_src.to_string()
+        std::borrow::Cow::Borrowed(test_src)
     } else {
-        format!("{}\n{}", decorator_src, test_src)
+        std::borrow::Cow::Owned(format!("{}\n{}", decorator_src, test_src))
     };
 
     if lang == Lang::Python {
-        let py_patch_target_re =
-            Regex::new(r#"\bpatch(?:\.object)?\s*\(\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*,\s*)?['"]([^'"]+)['"]"#)
-                .unwrap();
-        for cap in py_patch_target_re.captures_iter(&combined_src) {
+        for cap in py_patch_target_re().captures_iter(&combined_src) {
             if let Some(m) = cap.get(1) {
                 let target = m.as_str();
                 if let Some(last) = target.rsplit('.').next() {
@@ -1674,25 +2023,18 @@ fn is_mock_testing_mock(
                 }
             }
         }
-        let py_monkeypatch_re =
-            Regex::new(r#"\bmonkeypatch\.setattr\s*\(\s*[A-Za-z_][A-Za-z0-9_.]*\s*,\s*['"]([^'"]+)['"]"#)
-                .unwrap();
-        for cap in py_monkeypatch_re.captures_iter(&combined_src) {
+        for cap in py_monkeypatch_re().captures_iter(&combined_src) {
             if let Some(m) = cap.get(1) {
                 mocked_symbols.insert(m.as_str().to_string());
             }
         }
     } else if matches!(lang, Lang::JavaScript | Lang::TypeScript) {
-        let js_spy_re =
-            Regex::new(r#"\b(?:jest|vi)\.spyOn\s*\(\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*,\s*['"`]([^'"`]+)['"`]"#)
-                .unwrap();
-        for cap in js_spy_re.captures_iter(&combined_src) {
+        for cap in js_spy_re().captures_iter(&combined_src) {
             if let Some(m) = cap.get(2) {
                 mocked_symbols.insert(m.as_str().to_string());
             }
         }
-        let js_mock_re = Regex::new(r#"\b(?:jest|vi)\.mock\s*\(\s*['"`]([^'"`]+)['"`]"#).unwrap();
-        for cap in js_mock_re.captures_iter(&combined_src) {
+        for cap in js_file_mock_re().captures_iter(&combined_src) {
             if let Some(m) = cap.get(1) {
                 let stem = Path::new(m.as_str())
                     .file_stem()
@@ -1706,12 +2048,8 @@ fn is_mock_testing_mock(
     }
 
     // Track variables assigned directly from calling a mock or a mocked target symbol.
-    let assign_call_re = Regex::new(
-        r"\b([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?:await\s+)?([A-Za-z_$][A-Za-z0-9_$]*)(?:\.([A-Za-z_$][A-Za-z0-9_$]*))*\s*\(",
-    )
-    .unwrap();
     let mut mock_derived_vars = mock_vars.clone();
-    for cap in assign_call_re.captures_iter(test_src) {
+    for cap in assign_call_re().captures_iter(test_src) {
         if let (Some(lhs), Some(rhs_root)) = (cap.get(1), cap.get(2)) {
             let rhs_method = cap.get(3).map(|m| m.as_str()).unwrap_or("");
             if mock_derived_vars.contains(rhs_root.as_str())
@@ -1726,10 +2064,7 @@ fn is_mock_testing_mock(
 
     // --- Path 1: Pure mock-on-mock (zero real functions invoked) ---
     if !mock_vars.is_empty() {
-        let call_re = Regex::new(
-            r"(?m)(?:^|[^.\w])([A-Za-z_$][A-Za-z0-9_$]*)(?:\.([A-Za-z_$][A-Za-z0-9_$]*))*\s*\(",
-        )
-        .unwrap();
+        let call_re = call_re();
 
         let mut has_mock_call = false;
         let mut has_real_call = false;
@@ -1787,15 +2122,9 @@ fn is_mock_testing_mock(
     }
 
     // Check whether the test has ZERO behavioral assertions on real outputs/state.
-    let assert_line_re = Regex::new(
-        r"\b(assert|expect\(|assertEqual|assertTrue|assertFalse|assertRaises)\b|\.assert_(called|not_called|any_call)",
-    )
-    .unwrap();
-    let mock_matcher_re = Regex::new(
-        r"(\.assert_(?:called|called_once|called_with|called_once_with|any_call|not_called)\b|\.(?:toHaveBeenCalled|toHaveBeenCalledWith|toHaveBeenCalledTimes|toHaveReturned|toHaveReturnedWith|calledOnce|calledWith)\b)",
-    )
-    .unwrap();
-    let ident_re = Regex::new(r"\b([A-Za-z_$][A-Za-z0-9_$]*)\b").unwrap();
+    let assert_line_re = assert_line_re();
+    let mock_matcher_re = mock_matcher_re();
+    let ident_re = ident_re();
 
     let mut mock_assertions = 0usize;
     let mut real_assertions = 0usize;
@@ -1924,10 +2253,11 @@ fn detect_duplicate_bodies(fingerprints: &[BodyFingerprint], findings: &mut Vec<
     for fp in fingerprints {
         groups.entry((fp.lang, fp.hash)).or_default().push(fp);
     }
-    for group in groups.values() {
+    for mut group in groups.into_values() {
         if group.len() < 2 {
             continue;
         }
+        group.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.line.cmp(&b.line)));
         let first = group[0];
         for dup in group.iter().skip(1) {
             if dup.file == first.file && dup.line == first.line {
@@ -1992,30 +2322,48 @@ fn is_skipped_dir_name(name: &str) -> bool {
     )
 }
 
+fn ends_with_ignore_ascii_case(s: &str, suffix: &str) -> bool {
+    s.len() >= suffix.len()
+        && s.as_bytes()[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix.as_bytes())
+}
+
 fn is_skipped_rel_path(rel_str: &str, config: &Config) -> bool {
     if config.is_ignored(rel_str) {
         return true;
     }
-    let lower = rel_str.to_ascii_lowercase();
-    if lower.ends_with(".min.js") || lower.ends_with(".min.ts") || lower.ends_with(".bundle.js") {
+    if ends_with_ignore_ascii_case(rel_str, ".min.js")
+        || ends_with_ignore_ascii_case(rel_str, ".min.ts")
+        || ends_with_ignore_ascii_case(rel_str, ".bundle.js")
+    {
         return true;
     }
     rel_str.split('/').any(is_skipped_dir_name)
 }
 
-fn collect_repo_source_files(repo_root: &Path, config: &Config) -> Vec<(String, std::path::PathBuf)> {
-    const MAX_SCAN_FILE_BYTES: u64 = 512 * 1024;
+const MAX_SCAN_FILE_BYTES: u64 = 512 * 1024;
 
-    // Fast path: if this is a git repository, `git ls-files` respects `.gitignore`
-    // natively and avoids walking untracked build outputs and dependency trees.
+fn collect_repo_source_files(
+    repo_root: &Path,
+    config: &Config,
+    extra_paths: &[String],
+) -> Vec<String> {
+    // Fast path: if this is a git repository, `git ls-files -z --cached` reads only the
+    // git index in memory (~20ms on 24k+ file monorepos vs >1s for `--others` directory
+    // walks), respects `.gitignore`, and avoids walking build/dependency trees.
     if repo_root.join(".git").exists() {
         if let Ok(output) = std::process::Command::new("git")
             .arg("-C")
             .arg(repo_root)
-            .args(["ls-files", "-z", "--cached", "--others", "--exclude-standard"])
+            .args(["ls-files", "-z", "--cached"])
             .output()
         {
-            if output.status.success() {
+            if output.status.success() && !output.stdout.is_empty() {
+                let mut unseen_extras: HashSet<&str> = extra_paths
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|p| detect_lang(p).is_some() && !is_skipped_rel_path(p, config))
+                    .collect();
+
                 let mut files = Vec::new();
                 for raw in output.stdout.split(|&b| b == 0) {
                     if raw.is_empty() {
@@ -2024,16 +2372,22 @@ fn collect_repo_source_files(repo_root: &Path, config: &Config) -> Vec<(String, 
                     let Ok(rel_raw) = std::str::from_utf8(raw) else {
                         continue;
                     };
-                    let rel_str = rel_raw.replace('\\', "/");
-                    if detect_lang(&rel_str).is_none() || is_skipped_rel_path(&rel_str, config) {
+                    let rel_cow: std::borrow::Cow<'_, str> = if rel_raw.contains('\\') {
+                        std::borrow::Cow::Owned(rel_raw.replace('\\', "/"))
+                    } else {
+                        std::borrow::Cow::Borrowed(rel_raw)
+                    };
+                    let rel_str = rel_cow.as_ref();
+                    if detect_lang(rel_str).is_none() || is_skipped_rel_path(rel_str, config) {
                         continue;
                     }
-                    let full = repo_root.join(&rel_str);
-                    if let Ok(meta) = fs::metadata(&full) {
-                        if meta.is_file() && meta.len() <= MAX_SCAN_FILE_BYTES {
-                            files.push((rel_str, full));
-                        }
+                    if !unseen_extras.is_empty() {
+                        unseen_extras.remove(rel_str);
                     }
+                    files.push(rel_cow.into_owned());
+                }
+                for extra in unseen_extras {
+                    files.push(extra.to_string());
                 }
                 return files;
             }
@@ -2044,8 +2398,22 @@ fn collect_repo_source_files(repo_root: &Path, config: &Config) -> Vec<(String, 
     for entry in WalkDir::new(repo_root)
         .into_iter()
         .filter_entry(|e| {
+            if e.depth() == 0 {
+                return true;
+            }
             let name = e.file_name().to_string_lossy();
-            !is_skipped_dir_name(&name)
+            if is_skipped_dir_name(&name) {
+                return false;
+            }
+            if e.file_type().is_dir() && !config.ignore.is_empty() {
+                if let Ok(rel) = e.path().strip_prefix(repo_root) {
+                    let rel_str = rel.to_string_lossy();
+                    if config.is_ignored(&rel_str) {
+                        return false;
+                    }
+                }
+            }
+            true
         })
         .flatten()
     {
@@ -2059,13 +2427,109 @@ fn collect_repo_source_files(repo_root: &Path, config: &Config) -> Vec<(String, 
         if detect_lang(&rel_str).is_none() || is_skipped_rel_path(&rel_str, config) {
             continue;
         }
-        if let Ok(meta) = entry.metadata() {
-            if meta.len() <= MAX_SCAN_FILE_BYTES {
-                files.push((rel_str, entry.path().to_path_buf()));
-            }
-        }
+        files.push(rel_str);
     }
     files
+}
+
+#[inline]
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+#[inline]
+fn has_word_boundary_before(haystack: &str, start: usize) -> bool {
+    if start == 0 {
+        return true;
+    }
+    let prev = haystack.as_bytes()[start - 1];
+    if prev < 0x80 {
+        !(prev.is_ascii_alphanumeric() || prev == b'_')
+    } else {
+        haystack[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_word_char(c))
+    }
+}
+
+#[inline]
+fn has_word_boundary_after(haystack: &str, end: usize) -> bool {
+    if end >= haystack.len() {
+        return true;
+    }
+    let next = haystack.as_bytes()[end];
+    if next < 0x80 {
+        !(next.is_ascii_alphanumeric() || next == b'_')
+    } else {
+        haystack[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| !is_word_char(c))
+    }
+}
+
+/// Fast zero-regex equivalent of `\b<sym>\s*\(`.
+fn has_call_occurrence(haystack: &str, sym: &str) -> bool {
+    if sym.is_empty() {
+        return false;
+    }
+    for (start, _) in haystack.match_indices(sym) {
+        if !has_word_boundary_before(haystack, start) {
+            continue;
+        }
+        let rest = &haystack[start + sym.len()..];
+        let trimmed = rest.trim_start();
+        if trimmed.starts_with('(') {
+            return true;
+        }
+    }
+    false
+}
+
+/// Fast zero-regex equivalent of `\b<sym>\b`.
+fn has_word_occurrence(haystack: &str, sym: &str) -> bool {
+    if sym.is_empty() {
+        return false;
+    }
+    for (start, _) in haystack.match_indices(sym) {
+        let end = start + sym.len();
+        if has_word_boundary_before(haystack, start) && has_word_boundary_after(haystack, end) {
+            return true;
+        }
+    }
+    false
+}
+
+fn read_bounded_file(path: &Path, buf: &mut Vec<u8>) -> bool {
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    let Ok(meta) = file.metadata() else {
+        return false;
+    };
+    if !meta.is_file() || meta.len() > MAX_SCAN_FILE_BYTES {
+        return false;
+    }
+    let expected = meta.len() as usize;
+    buf.clear();
+    if expected == 0 {
+        return true;
+    }
+    buf.resize(expected, 0);
+    let mut read_total = 0;
+    while read_total < expected {
+        match file.read(&mut buf[read_total..]) {
+            Ok(0) => {
+                buf.truncate(read_total);
+                return true;
+            }
+            Ok(n) => read_total += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return false,
+        }
+    }
+    true
 }
 
 fn scan_repo_references(
@@ -2073,92 +2537,267 @@ fn scan_repo_references(
     changed: &[(String, String)],
     new_public: &[(String, String, usize)],
     config: &Config,
+    extra_paths: &[String],
 ) -> (Vec<BlastEntry>, BTreeSet<String>) {
     if changed.is_empty() && new_public.is_empty() {
         return (Vec::new(), BTreeSet::new());
     }
 
-    let mut unique_changed: BTreeMap<(String, String), Regex> = BTreeMap::new();
+    // Group changed definitions by symbol name so each unique symbol is matched once per file.
+    let mut changed_by_sym: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for (file, sym) in changed {
-        let key = (file.clone(), sym.clone());
-        unique_changed.entry(key).or_insert_with(|| {
-            Regex::new(&format!(r"\b{}\s*\(", regex::escape(sym))).unwrap()
-        });
+        changed_by_sym
+            .entry(sym.clone())
+            .or_default()
+            .insert(file.clone());
+    }
+    let changed_syms: Vec<String> = changed_by_sym.keys().cloned().collect();
+    let changed_sym_defs: Vec<Vec<String>> = changed_by_sym
+        .into_values()
+        .map(|defs| defs.into_iter().collect())
+        .collect();
+
+    let public_set: BTreeSet<String> = new_public.iter().map(|(_, sym, _)| sym.clone()).collect();
+    let public_syms: Vec<String> = public_set.into_iter().collect();
+
+    let num_changed = changed_syms.len();
+    let num_public = public_syms.len();
+
+    // Build a single SIMD-accelerated byte literal prefilter covering all changed & public
+    // symbols. Non-matching files (~99% of a monorepo) are rejected in a single linear pass
+    // without UTF-8 validation or per-symbol boundary checks.
+    let mut literal_patterns: Vec<String> = Vec::with_capacity(num_changed + num_public);
+    for sym in &changed_syms {
+        literal_patterns.push(regex::escape(sym));
+    }
+    for sym in &public_syms {
+        literal_patterns.push(regex::escape(sym));
+    }
+    let literal_set = BytesRegexSetBuilder::new(&literal_patterns)
+        .unicode(false)
+        .size_limit(64 * 1024 * 1024)
+        .build()
+        .ok();
+
+    let rel_paths = collect_repo_source_files(repo_root, config, extra_paths);
+    if rel_paths.is_empty() {
+        return (Vec::new(), BTreeSet::new());
     }
 
-    let mut unique_public: BTreeMap<String, Regex> = BTreeMap::new();
-    for (_, sym, _) in new_public {
-        unique_public.entry(sym.clone()).or_insert_with(|| {
-            Regex::new(&format!(r"\b{}\b", regex::escape(sym))).unwrap()
-        });
+    struct WorkerResult {
+        callers: Vec<(usize, usize, CallerRef)>,
+        test_refs: Vec<bool>,
     }
+
+    let scan_file = |rel_str: &str,
+                     path_buf: &mut std::path::PathBuf,
+                     buf: &mut Vec<u8>,
+                     local_callers: &mut Vec<(usize, usize, CallerRef)>,
+                     local_test_refs: &mut [bool]| {
+        path_buf.clear();
+        path_buf.push(repo_root);
+        path_buf.push(rel_str);
+        if !read_bounded_file(path_buf, buf) {
+            return;
+        }
+
+        if let Some(ref lset) = literal_set {
+            if !lset.is_match(buf) {
+                return;
+            }
+            let Ok(content) = std::str::from_utf8(buf) else {
+                return;
+            };
+            let is_test = is_test_path(rel_str);
+            // For Rust non-test source files, detect inline `#[cfg(test)]` modules so
+            // inline unit tests count as real test coverage and test callers.
+            let rust_cfg_test_pos = if !is_test && rel_str.ends_with(".rs") {
+                content.find("#[cfg(test)]")
+            } else {
+                None
+            };
+            let rust_prod_slice = rust_cfg_test_pos.map(|idx| &content[..idx]);
+            let rust_inline_test_slice = rust_cfg_test_pos.map(|idx| &content[idx..]);
+
+            for pat_idx in lset.matches(buf).into_iter() {
+                if pat_idx < num_changed {
+                    let sym = changed_syms[pat_idx].as_str();
+                    if has_call_occurrence(content, sym) {
+                        let caller_is_test = is_test
+                            || rust_prod_slice.is_some_and(|prod| !has_call_occurrence(prod, sym));
+                        for (def_idx, def_file) in changed_sym_defs[pat_idx].iter().enumerate() {
+                            if def_file != rel_str {
+                                local_callers.push((
+                                    pat_idx,
+                                    def_idx,
+                                    CallerRef {
+                                        file: rel_str.to_string(),
+                                        is_test: caller_is_test,
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                } else {
+                    let pub_idx = pat_idx - num_changed;
+                    if local_test_refs[pub_idx] {
+                        continue;
+                    }
+                    let sym = public_syms[pub_idx].as_str();
+                    if is_test {
+                        if has_word_occurrence(content, sym) {
+                            local_test_refs[pub_idx] = true;
+                        }
+                    } else if let Some(inline_tests) = rust_inline_test_slice {
+                        if has_word_occurrence(inline_tests, sym) {
+                            local_test_refs[pub_idx] = true;
+                        }
+                    }
+                }
+            }
+        } else {
+            // Fallback when RegexSet exceeds size limits (extremely large symbol counts).
+            let Ok(content) = std::str::from_utf8(buf) else {
+                return;
+            };
+            let is_test = is_test_path(rel_str);
+            let rust_cfg_test_pos = if !is_test && rel_str.ends_with(".rs") {
+                content.find("#[cfg(test)]")
+            } else {
+                None
+            };
+            let rust_prod_slice = rust_cfg_test_pos.map(|idx| &content[..idx]);
+            let rust_inline_test_slice = rust_cfg_test_pos.map(|idx| &content[idx..]);
+
+            for (pat_idx, sym) in changed_syms.iter().enumerate() {
+                if has_call_occurrence(content, sym) {
+                    let caller_is_test = is_test
+                        || rust_prod_slice.is_some_and(|prod| !has_call_occurrence(prod, sym));
+                    for (def_idx, def_file) in changed_sym_defs[pat_idx].iter().enumerate() {
+                        if def_file != rel_str {
+                            local_callers.push((
+                                pat_idx,
+                                def_idx,
+                                CallerRef {
+                                    file: rel_str.to_string(),
+                                    is_test: caller_is_test,
+                                },
+                            ));
+                        }
+                    }
+                }
+            }
+            if is_test {
+                for (pub_idx, sym) in public_syms.iter().enumerate() {
+                    if !local_test_refs[pub_idx] && has_word_occurrence(content, sym) {
+                        local_test_refs[pub_idx] = true;
+                    }
+                }
+            } else if let Some(inline_tests) = rust_inline_test_slice {
+                for (pub_idx, sym) in public_syms.iter().enumerate() {
+                    if !local_test_refs[pub_idx] && has_word_occurrence(inline_tests, sym) {
+                        local_test_refs[pub_idx] = true;
+                    }
+                }
+            }
+        }
+    };
+
+    let worker_results: Vec<WorkerResult> = if rel_paths.len() < 32 {
+        let mut path_buf = std::path::PathBuf::with_capacity(256);
+        let mut buf = Vec::with_capacity(16 * 1024);
+        let mut local_callers = Vec::new();
+        let mut local_test_refs = vec![false; num_public];
+        for rel_str in &rel_paths {
+            scan_file(
+                rel_str,
+                &mut path_buf,
+                &mut buf,
+                &mut local_callers,
+                &mut local_test_refs,
+            );
+        }
+        vec![WorkerResult {
+            callers: local_callers,
+            test_refs: local_test_refs,
+        }]
+    } else {
+        const CHUNK_SIZE: usize = 32;
+        let num_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(32)
+            .min(rel_paths.len().div_ceil(CHUNK_SIZE));
+        let cursor = AtomicUsize::new(0);
+
+        std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(num_threads);
+            for _ in 0..num_threads {
+                let cursor = &cursor;
+                let rel_paths = &rel_paths;
+                let scan_file = &scan_file;
+                handles.push(s.spawn(move || {
+                    let mut path_buf = std::path::PathBuf::with_capacity(256);
+                    let mut buf = Vec::with_capacity(16 * 1024);
+                    let mut local_callers = Vec::new();
+                    let mut local_test_refs = vec![false; num_public];
+                    loop {
+                        let start = cursor.fetch_add(CHUNK_SIZE, Ordering::Relaxed);
+                        if start >= rel_paths.len() {
+                            break;
+                        }
+                        let end = (start + CHUNK_SIZE).min(rel_paths.len());
+                        for rel_str in &rel_paths[start..end] {
+                            scan_file(
+                                rel_str,
+                                &mut path_buf,
+                                &mut buf,
+                                &mut local_callers,
+                                &mut local_test_refs,
+                            );
+                        }
+                    }
+                    WorkerResult {
+                        callers: local_callers,
+                        test_refs: local_test_refs,
+                    }
+                }));
+            }
+            handles
+                .into_iter()
+                .filter_map(|h| h.join().ok())
+                .collect::<Vec<_>>()
+        })
+    };
 
     let mut callers_map: BTreeMap<(String, String), Vec<CallerRef>> = BTreeMap::new();
     let mut test_refs: BTreeSet<String> = BTreeSet::new();
 
-    for (rel_str, full_path) in collect_repo_source_files(repo_root, config) {
-        let Ok(content) = fs::read_to_string(&full_path) else {
-            continue;
-        };
-        let is_test = is_test_path(&rel_str);
-        // For Rust non-test source files, detect inline `#[cfg(test)]` modules so
-        // inline unit tests count as real test coverage and test callers.
-        let rust_inline_test_slice: Option<&str> =
-            if !is_test && rel_str.ends_with(".rs") {
-                content.find("#[cfg(test)]").map(|idx| &content[idx..])
-            } else {
-                None
-            };
-        let rust_prod_slice: Option<&str> =
-            if !is_test && rel_str.ends_with(".rs") {
-                content.find("#[cfg(test)]").map(|idx| &content[..idx])
-            } else {
-                None
-            };
-
-        for ((def_file, sym), re) in &unique_changed {
-            if def_file == &rel_str {
-                continue;
-            }
-            if !content.contains(sym.as_str()) {
-                continue;
-            }
-            if re.is_match(&content) {
-                let caller_is_test = is_test
-                    || rust_prod_slice.is_some_and(|prod| !re.is_match(prod));
-                callers_map
-                    .entry((def_file.clone(), sym.clone()))
-                    .or_default()
-                    .push(CallerRef {
-                        file: rel_str.clone(),
-                        is_test: caller_is_test,
-                    });
-            }
+    for wr in worker_results {
+        for (pat_idx, def_idx, caller) in wr.callers {
+            let def_file = changed_sym_defs[pat_idx][def_idx].clone();
+            let sym = changed_syms[pat_idx].clone();
+            callers_map.entry((def_file, sym)).or_default().push(caller);
         }
-
-        if is_test {
-            for (sym, re) in &unique_public {
-                if content.contains(sym.as_str()) && re.is_match(&content) {
-                    test_refs.insert(sym.clone());
-                }
-            }
-        } else if let Some(inline_tests) = rust_inline_test_slice {
-            for (sym, re) in &unique_public {
-                if inline_tests.contains(sym.as_str()) && re.is_match(inline_tests) {
-                    test_refs.insert(sym.clone());
-                }
+        for (pub_idx, found) in wr.test_refs.into_iter().enumerate() {
+            if found {
+                test_refs.insert(public_syms[pub_idx].clone());
             }
         }
     }
 
     let blast = callers_map
         .into_iter()
-        .map(|((file, symbol), callers)| BlastEntry {
-            file,
-            symbol,
-            callers,
-            signature_change: None,
-            unupdated_callers: Vec::new(),
+        .map(|((file, symbol), mut callers)| {
+            callers.sort_by(|a, b| a.file.cmp(&b.file));
+            callers.dedup_by(|a, b| a.file == b.file);
+            BlastEntry {
+                file,
+                symbol,
+                callers,
+                signature_change: None,
+                unupdated_callers: Vec::new(),
+            }
         })
         .collect();
 
@@ -2174,7 +2813,7 @@ pub fn compute_symbol_blast_radius(
     let def = def_file.unwrap_or("").to_string();
     let changed = vec![(def.clone(), symbol.to_string())];
     let config = Config::load(repo_root, None).unwrap_or_default();
-    let (mut entries, _) = scan_repo_references(repo_root, &changed, &[], &config);
+    let (mut entries, _) = scan_repo_references(repo_root, &changed, &[], &config, &[]);
     entries.pop().unwrap_or(BlastEntry {
         file: def,
         symbol: symbol.to_string(),

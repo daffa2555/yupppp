@@ -1,6 +1,9 @@
 use serde::Serialize;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DiffLine {
@@ -17,23 +20,32 @@ pub struct FileDiff {
     pub is_deleted: bool,
 }
 
+pub fn is_test_path(path: &str) -> bool {
+    let lower: Cow<'_, str> = if path.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(path.to_lowercase())
+    } else {
+        Cow::Borrowed(path)
+    };
+    let lower = lower.as_ref();
+    lower.contains("/test/")
+        || lower.contains("/tests/")
+        || lower.contains("__tests__")
+        || lower.starts_with("test_")
+        || lower.starts_with("tests/")
+        || lower.ends_with("_test.go")
+        || lower.ends_with("_test.rs")
+        || lower.ends_with(".test.ts")
+        || lower.ends_with(".test.tsx")
+        || lower.ends_with(".test.js")
+        || lower.ends_with(".test.mjs")
+        || lower.ends_with(".spec.ts")
+        || lower.ends_with(".spec.js")
+        || lower.contains("/test_")
+}
+
 impl FileDiff {
     pub fn is_test_file(&self) -> bool {
-        let lower = self.path.to_lowercase();
-        lower.contains("/test/")
-            || lower.contains("/tests/")
-            || lower.contains("__tests__")
-            || lower.starts_with("test_")
-            || lower.starts_with("tests/")
-            || lower.ends_with("_test.go")
-            || lower.ends_with("_test.rs")
-            || lower.ends_with(".test.ts")
-            || lower.ends_with(".test.tsx")
-            || lower.ends_with(".test.js")
-            || lower.ends_with(".test.mjs")
-            || lower.ends_with(".spec.ts")
-            || lower.ends_with(".spec.js")
-            || lower.contains("/test_")
+        is_test_path(&self.path)
     }
 }
 
@@ -270,4 +282,153 @@ pub fn git_show_file(repo_root: &Path, base_ref: &str, rel_path: &str) -> Option
         return None;
     }
     Some(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+fn parse_cat_file_object_header(line: &str) -> Option<(&str, usize)> {
+    let mut parts = line.split(' ');
+    let oid = parts.next()?;
+    let obj_type = parts.next()?;
+    let size_str = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if oid.len() < 40 || !oid.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    if !matches!(obj_type, "blob" | "tree" | "commit" | "tag") {
+        return None;
+    }
+    let size = size_str.parse::<usize>().ok()?;
+    Some((obj_type, size))
+}
+
+/// Batch-fetch file contents at specific git revisions using a single `git cat-file --batch`
+/// subprocess instead of spawning one `git show` process per file.
+///
+/// Keys in the returned map are `(git_ref, rel_path)`. Missing or non-blob objects are omitted.
+pub fn git_show_files_batch(
+    repo_root: &Path,
+    specs: &[(String, String)],
+) -> HashMap<(String, String), String> {
+    let mut results = HashMap::new();
+    if specs.is_empty() {
+        return results;
+    }
+
+    let mut seen: HashSet<(&str, &str)> = HashSet::with_capacity(specs.len());
+    let mut batch_specs: Vec<(&str, &str)> = Vec::with_capacity(specs.len());
+    let mut fallback_specs: Vec<(&str, &str)> = Vec::new();
+
+    for (git_ref, rel_path) in specs {
+        let pair = (git_ref.as_str(), rel_path.as_str());
+        if !seen.insert(pair) {
+            continue;
+        }
+        if git_ref.contains(['\n', '\r']) || rel_path.contains(['\n', '\r']) {
+            fallback_specs.push(pair);
+        } else {
+            batch_specs.push(pair);
+        }
+    }
+
+    if !batch_specs.is_empty() {
+        let Ok(mut child) = Command::new("git")
+            .current_dir(repo_root)
+            .args(["cat-file", "--batch"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            return results;
+        };
+
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take();
+        let mut fallback_start: Option<usize> = None;
+
+        if let (Some(stdin), Some(stdout)) = (stdin, stdout) {
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    let mut writer = BufWriter::new(stdin);
+                    for &(git_ref, rel_path) in &batch_specs {
+                        if writeln!(writer, "{}:{}", git_ref, rel_path).is_err() {
+                            break;
+                        }
+                    }
+                    let _ = writer.flush();
+                });
+
+                let mut reader = BufReader::new(stdout);
+                let mut header = String::new();
+                let mut blob_buf = Vec::new();
+
+                for (idx, &(git_ref, rel_path)) in batch_specs.iter().enumerate() {
+                    header.clear();
+                    match reader.read_line(&mut header) {
+                        Ok(0) | Err(_) => {
+                            fallback_start = Some(idx);
+                            break;
+                        }
+                        Ok(_) => {}
+                    }
+                    let trimmed = header.trim_end_matches(['\r', '\n']);
+                    if let Some((obj_type, size)) = parse_cat_file_object_header(trimmed) {
+                        if obj_type == "blob" {
+                            blob_buf.resize(size, 0);
+                            if reader.read_exact(&mut blob_buf).is_err() {
+                                fallback_start = Some(idx);
+                                break;
+                            }
+                            let mut nl = [0u8; 1];
+                            if reader.read_exact(&mut nl).is_err() {
+                                fallback_start = Some(idx);
+                                break;
+                            }
+                            results.insert(
+                                (git_ref.to_string(), rel_path.to_string()),
+                                String::from_utf8_lossy(&blob_buf).into_owned(),
+                            );
+                        } else {
+                            // Consume non-blob object payload + trailing LF to stay in sync.
+                            let skip_len = size as u64 + 1;
+                            if io::copy(&mut reader.by_ref().take(skip_len), &mut io::sink())
+                                .is_err()
+                            {
+                                fallback_start = Some(idx);
+                                break;
+                            }
+                        }
+                    } else if trimmed.ends_with(" missing")
+                        || trimmed.ends_with(" ambiguous")
+                        || trimmed.ends_with(" excluded")
+                        || trimmed.ends_with(" dangling")
+                    {
+                        // Missing object has no body bytes.
+                    } else {
+                        fallback_start = Some(idx);
+                        break;
+                    }
+                }
+            });
+        }
+
+        let status = child.wait().ok();
+        if let Some(start) = fallback_start {
+            // Only fall back to individual `git show` if git itself didn't fail outright at
+            // item 0 (e.g., when repo_root is not a git repository).
+            let git_ok = status.is_some_and(|st| st.success());
+            if git_ok || start > 0 {
+                fallback_specs.extend_from_slice(&batch_specs[start..]);
+            }
+        }
+    }
+
+    for (git_ref, rel_path) in fallback_specs {
+        if let Some(content) = git_show_file(repo_root, git_ref, rel_path) {
+            results.insert((git_ref.to_string(), rel_path.to_string()), content);
+        }
+    }
+
+    results
 }

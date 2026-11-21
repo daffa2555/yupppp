@@ -1950,3 +1950,43 @@ fn repo_scan_skips_build_out_minified_and_config_ignored_paths() {
 
     let _ = fs::remove_dir_all(dir);
 }
+
+#[test]
+fn git_show_files_batch_fetches_multiple_revisions_and_ignores_missing_blobs() {
+    use yupp::diff::git_show_files_batch;
+
+    let dir = make_temp_dir("git-batch-fetch");
+    init_git_repo(&dir);
+    fs::create_dir_all(dir.join("src")).unwrap();
+    fs::write(dir.join("src/a.rs"), "pub fn v1() -> i32 { 1 }\n").unwrap();
+    fs::write(dir.join("src/b.rs"), "pub fn b1() -> i32 { 2 }\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-m", "c1"]);
+
+    fs::write(dir.join("src/a.rs"), "pub fn v2() -> i32 { 10 }\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-m", "c2"]);
+
+    let specs = vec![
+        ("HEAD~1".to_string(), "src/a.rs".to_string()),
+        ("HEAD".to_string(), "src/a.rs".to_string()),
+        ("HEAD".to_string(), "src/b.rs".to_string()),
+        ("HEAD".to_string(), "src/does_not_exist.rs".to_string()),
+    ];
+    let map = git_show_files_batch(&dir, &specs);
+    assert_eq!(
+        map.get(&("HEAD~1".to_string(), "src/a.rs".to_string())).map(|s| s.as_str()),
+        Some("pub fn v1() -> i32 { 1 }\n")
+    );
+    assert_eq!(
+        map.get(&("HEAD".to_string(), "src/a.rs".to_string())).map(|s| s.as_str()),
+        Some("pub fn v2() -> i32 { 10 }\n")
+    );
+    assert_eq!(
+        map.get(&("HEAD".to_string(), "src/b.rs".to_string())).map(|s| s.as_str()),
+        Some("pub fn b1() -> i32 { 2 }\n")
+    );
+    assert!(!map.contains_key(&("HEAD".to_string(), "src/does_not_exist.rs".to_string())));
+
+    let _ = fs::remove_dir_all(dir);
+}
