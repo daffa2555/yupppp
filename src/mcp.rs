@@ -1,6 +1,6 @@
 use crate::ast::{analyze_diff_with_options, compute_symbol_blast_radius, AnalyzeOptions, Severity};
 use crate::config::Config;
-use crate::diff::{parse_unified_diff, resolve_base_ref, DiffLine, FileDiff};
+use crate::diff::{parse_unified_diff, resolve_base_ref, resolve_head_ref, DiffLine, FileDiff};
 use crate::report::{render_terminal, Report, Verdict};
 use serde_json::{json, Value};
 use std::fs;
@@ -262,12 +262,21 @@ fn tool_scan_diff(args: &Value) -> Value {
     } else {
         resolve_base_ref(range, staged, &repo_root)
     };
+    let head_ref = if raw_diff_arg.is_some() {
+        range.and_then(|r| resolve_head_ref(Some(r), false))
+    } else {
+        resolve_head_ref(range, staged)
+    };
 
     let files = parse_unified_diff(&raw_diff);
     let lines_added: usize = files.iter().map(|f| f.added.len()).sum();
     let lines_removed: usize = files.iter().map(|f| f.removed.len()).sum();
 
-    let opts = AnalyzeOptions { base_ref, config };
+    let opts = AnalyzeOptions {
+        base_ref,
+        head_ref,
+        config,
+    };
     let (findings, blast_radius) = analyze_diff_with_options(&files, &repo_root, &opts);
     let blockers = findings
         .iter()
@@ -351,6 +360,7 @@ fn tool_check_file(args: &Value) -> Value {
         path: rel_path,
         added,
         removed: Vec::new(),
+        is_deleted: false,
     }];
 
     let config = match Config::load(&repo_root, None) {
@@ -360,6 +370,7 @@ fn tool_check_file(args: &Value) -> Value {
     let strict = strict_arg.or(config.strict).unwrap_or(false);
     let opts = AnalyzeOptions {
         base_ref: None,
+        head_ref: None,
         config,
     };
 

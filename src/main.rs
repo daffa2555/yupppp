@@ -1,13 +1,15 @@
 use clap::{Parser, Subcommand, ValueEnum};
-use std::io::{self, Read};
+use std::io::{self, IsTerminal, Read};
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 use std::time::Instant;
 use yupp::ast::{analyze_diff_with_options, AnalyzeOptions, Severity};
 use yupp::config::{init_config, Config};
-use yupp::diff::{parse_unified_diff, resolve_base_ref};
+use yupp::diff::{parse_unified_diff, resolve_base_ref, resolve_head_ref};
 use yupp::mcp::run_mcp_stdio;
-use yupp::report::{render_pr_comment, render_sarif, render_terminal, Report, Verdict};
+use yupp::report::{
+    render_pr_comment, render_sarif, render_terminal_with_color, Report, Verdict,
+};
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
 enum Format {
@@ -15,6 +17,30 @@ enum Format {
     PrComment,
     Json,
     Sarif,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum ColorMode {
+    Auto,
+    Always,
+    Never,
+}
+
+fn should_use_color(
+    mode: ColorMode,
+    no_color_flag: bool,
+    is_tty: bool,
+    no_color_env: bool,
+    dumb_term: bool,
+) -> bool {
+    if no_color_flag {
+        return false;
+    }
+    match mode {
+        ColorMode::Always => true,
+        ColorMode::Never => false,
+        ColorMode::Auto => is_tty && !no_color_env && !dumb_term,
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -77,6 +103,14 @@ struct Cli {
     /// Disable emoji in output (ASCII only)
     #[arg(long)]
     no_emoji: bool,
+
+    /// Control ANSI color output in terminal mode (auto disables when stdout is not a TTY or NO_COLOR is set)
+    #[arg(long, value_enum, default_value_t = ColorMode::Auto)]
+    color: ColorMode,
+
+    /// Disable ANSI color output (equivalent to --color never)
+    #[arg(long)]
+    no_color: bool,
 }
 
 fn read_diff(cli: &Cli) -> Result<String, String> {
@@ -159,13 +193,24 @@ fn main() -> ExitCode {
     } else {
         resolve_base_ref(cli.range.as_deref(), cli.staged, &cli.repo)
     };
+    let head_ref = if cli.stdin {
+        cli.range
+            .as_deref()
+            .and_then(|r| resolve_head_ref(Some(r), false))
+    } else {
+        resolve_head_ref(cli.range.as_deref(), cli.staged)
+    };
 
     let files = parse_unified_diff(&raw_diff);
     let lines_added: usize = files.iter().map(|f| f.added.len()).sum();
     let lines_removed: usize = files.iter().map(|f| f.removed.len()).sum();
 
     let strict = cli.strict || config.strict.unwrap_or(false);
-    let opts = AnalyzeOptions { base_ref, config };
+    let opts = AnalyzeOptions {
+        base_ref,
+        head_ref,
+        config,
+    };
     let (findings, blast_radius) = analyze_diff_with_options(&files, &cli.repo, &opts);
     let blockers = findings
         .iter()
@@ -192,9 +237,20 @@ fn main() -> ExitCode {
         blast_radius,
     };
 
-    let use_emoji = !cli.no_emoji && std::env::var_os("NO_COLOR").is_none();
+    let no_color_env = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
+    let dumb_term = std::env::var("TERM")
+        .map(|v| v.eq_ignore_ascii_case("dumb"))
+        .unwrap_or(false);
+    let use_emoji = !cli.no_emoji && !no_color_env;
+    let use_color = should_use_color(
+        cli.color,
+        cli.no_color,
+        io::stdout().is_terminal(),
+        no_color_env,
+        dumb_term,
+    );
     match cli.format {
-        Format::Terminal => print!("{}", render_terminal(&report, use_emoji)),
+        Format::Terminal => print!("{}", render_terminal_with_color(&report, use_emoji, use_color)),
         Format::PrComment => print!("{}", render_pr_comment(&report, use_emoji)),
         Format::Json => {
             println!(
@@ -220,6 +276,7 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
     use yupp::ast::analyze_diff;
+    use yupp::report::render_terminal;
 
     fn make_temp_dir(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -426,5 +483,82 @@ mod tests {
         assert!(render_pr_comment(&fail_rep, false).contains("### nope [FAIL]"));
         let fail_json: serde_json::Value = serde_json::to_value(&fail_rep).unwrap();
         assert_eq!(fail_json["verdict"], "nope");
+    }
+
+    #[test]
+    fn ansi_color_resolution_and_terminal_styling() {
+        use yupp::ast::{Category, Finding};
+
+        // Color mode resolution matrix
+        assert!(should_use_color(ColorMode::Auto, false, true, false, false));
+        assert!(!should_use_color(ColorMode::Auto, false, false, false, false));
+        assert!(!should_use_color(ColorMode::Auto, false, true, true, false));
+        assert!(!should_use_color(ColorMode::Auto, false, true, false, true));
+        assert!(should_use_color(ColorMode::Always, false, false, true, true));
+        assert!(!should_use_color(ColorMode::Always, true, true, false, false));
+        assert!(!should_use_color(ColorMode::Never, false, true, false, false));
+
+        let ok_rep = Report {
+            version: "0.1.0",
+            verdict: Verdict::Yupp,
+            passed: true,
+            files_scanned: 1,
+            lines_added: 3,
+            lines_removed: 0,
+            elapsed_ms: 2,
+            blockers: 0,
+            warnings: 0,
+            findings: vec![],
+            blast_radius: vec![],
+        };
+        let ok_colored = render_terminal_with_color(&ok_rep, true, true);
+        assert!(ok_colored.contains("\x1b[1;32myupp 👌\x1b[0m"));
+        assert!(ok_colored.contains("\x1b[2m"));
+        assert!(!render_terminal_with_color(&ok_rep, true, false).contains("\x1b["));
+
+        let warn_rep = Report {
+            version: "0.1.0",
+            verdict: Verdict::Hmm,
+            passed: true,
+            files_scanned: 1,
+            lines_added: 4,
+            lines_removed: 0,
+            elapsed_ms: 3,
+            blockers: 0,
+            warnings: 1,
+            findings: vec![Finding {
+                severity: Severity::Warning,
+                category: Category::SilentSlop,
+                file: "src/parse.rs".into(),
+                line: 42,
+                rule: "slop/rust-unwrap".into(),
+                message: "New .unwrap()/.expect() panic hazard introduced".into(),
+            }],
+            blast_radius: vec![],
+        };
+        let warn_colored = render_terminal_with_color(&warn_rep, true, true);
+        assert!(warn_colored.contains("\x1b[1;33mhmm 🤔\x1b[0m"));
+        assert!(warn_colored.contains("\x1b[1msrc/parse.rs:42\x1b[0m"));
+        assert!(warn_colored.contains("\x1b[2m[slop/rust-unwrap]\x1b[0m"));
+        assert_eq!(
+            render_terminal(&warn_rep, true),
+            render_terminal_with_color(&warn_rep, true, false)
+        );
+
+        let fail_rep = Report {
+            version: "0.1.0",
+            verdict: Verdict::Nope,
+            passed: false,
+            files_scanned: 1,
+            lines_added: 1,
+            lines_removed: 2,
+            elapsed_ms: 5,
+            blockers: 1,
+            warnings: 0,
+            findings: vec![],
+            blast_radius: vec![],
+        };
+        let fail_colored = render_terminal_with_color(&fail_rep, true, true);
+        assert!(fail_colored.contains("\x1b[1;31mnope ❌\x1b[0m"));
     }
 }

@@ -54,6 +54,7 @@ pub struct CallerRef {
 #[derive(Debug, Clone, Default)]
 pub struct AnalyzeOptions {
     pub base_ref: Option<String>,
+    pub head_ref: Option<String>,
     pub config: Config,
 }
 
@@ -141,6 +142,7 @@ fn is_test_path(rel_path: &str) -> bool {
         path: rel_path.to_string(),
         added: vec![],
         removed: vec![],
+        is_deleted: false,
     }
     .is_test_file()
 }
@@ -270,6 +272,23 @@ pub fn analyze_diff_with_options(
             }
         }
 
+        // Pre-read post-change file content (from `head_ref` / git index when scanning
+        // a commit range or `--staged`, otherwise from the working tree on disk) so we
+        // can build a Tree-sitter string masker for multiline string literals before
+        // running line-based slop checks.
+        let disk_source = if !f.is_deleted {
+            opts.head_ref
+                .as_deref()
+                .and_then(|head| git_show_file(repo_root, head, &f.path))
+                .or_else(|| fs::read_to_string(repo_root.join(&f.path)).ok())
+        } else {
+            None
+        };
+        let string_masker = match (lang, disk_source.as_deref()) {
+            (Some(l), Some(src)) => StringMasker::new(l, src),
+            _ => None,
+        };
+
         // 2. Per-added-line deterministic checks
         for dl in &f.added {
             let text = dl.content.trim();
@@ -278,9 +297,13 @@ pub fn analyze_diff_with_options(
             }
             let is_comment =
                 text.starts_with("//") || text.starts_with('#') || text.starts_with('*');
-            // Strip string literals for code-pattern checks so rule descriptions/messages
-            // containing `"todo!()"` or `"console.log(1)"` do not trigger false positives.
-            let code_text = strip_string_literals(text);
+            // Mask string literals (including multiline strings via Tree-sitter node ranges)
+            // so rule descriptions, docstrings, raw strings, and template literals containing
+            // `"todo!()"` or `"console.log(1)"` do not trigger false positives.
+            let code_text = string_masker
+                .as_ref()
+                .and_then(|m| m.mask_line(dl.line_no, &dl.content))
+                .unwrap_or_else(|| strip_string_literals(text));
 
             if is_test && skip_re.is_match(&code_text) {
                 findings.push(Finding {
@@ -375,10 +398,53 @@ pub fn analyze_diff_with_options(
             }
         }
 
-        // 3. Tree-sitter AST checks on the actual file on disk
+        // 3. Tree-sitter AST checks on the actual file on disk (or deleted file's old AST)
         let Some(lang) = lang else { continue };
-        let full_path = repo_root.join(&f.path);
-        let Ok(source) = fs::read_to_string(&full_path) else {
+
+        if f.is_deleted {
+            if !is_test {
+                let old_src = opts
+                    .base_ref
+                    .as_deref()
+                    .and_then(|base| git_show_file(repo_root, base, &f.path))
+                    .or_else(|| {
+                        if f.removed.is_empty() {
+                            None
+                        } else {
+                            Some(
+                                f.removed
+                                    .iter()
+                                    .map(|l| l.content.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join("\n"),
+                            )
+                        }
+                    });
+                if let Some(src) = old_src {
+                    let old_sigs = extract_signatures(lang, &src);
+                    for old_sig in old_sigs.values() {
+                        if !old_sig.is_public || is_generic_symbol_name(&old_sig.name) {
+                            continue;
+                        }
+                        changed_symbols.push((f.path.clone(), old_sig.name.clone()));
+                        diff_ctx.modified_symbols.insert(old_sig.name.clone());
+                        breaking_events.push(BreakingEvent {
+                            file: f.path.clone(),
+                            symbol: old_sig.name.clone(),
+                            line: old_sig.line.max(1),
+                            removed: true,
+                            detail: format!(
+                                "Public symbol `{}` was removed (file deleted)",
+                                old_sig.name
+                            ),
+                        });
+                    }
+                }
+            }
+            continue;
+        }
+
+        let Some(source) = disk_source else {
             continue;
         };
         let added_lines: BTreeSet<usize> = f.added.iter().map(|l| l.line_no).collect();
@@ -639,6 +705,124 @@ fn is_generic_symbol_name(name: &str) -> bool {
             | "connect"
             | "disconnect"
     )
+}
+
+/// Tracks Tree-sitter string literal byte ranges across a source file so
+/// interior lines of multiline strings (Python `"""..."""` / `'''...'''`,
+/// Rust `r#"..."#`, JS/TS template literals `` `...` ``, Go raw strings `` `...` ``)
+/// are masked out before line-based slop checks.
+struct StringMasker<'a> {
+    source: &'a str,
+    line_spans: Vec<(usize, usize)>,
+    string_ranges: Vec<(usize, usize)>,
+}
+
+impl<'a> StringMasker<'a> {
+    fn new(lang: Lang, source: &'a str) -> Option<Self> {
+        let mut parser = Parser::new();
+        parser.set_language(&ts_language(lang)).ok()?;
+        let tree = parser.parse(source, None)?;
+
+        let mut line_spans = Vec::new();
+        let mut offset = 0usize;
+        for raw_line in source.split('\n') {
+            let line_len = raw_line
+                .strip_suffix('\r')
+                .map_or(raw_line.len(), |s| s.len());
+            line_spans.push((offset, offset + line_len));
+            offset += raw_line.len() + 1;
+        }
+
+        let mut string_ranges = Vec::new();
+        collect_string_ranges(lang, tree.root_node(), &mut string_ranges);
+        string_ranges.sort_unstable();
+
+        Some(Self {
+            source,
+            line_spans,
+            string_ranges,
+        })
+    }
+
+    fn mask_line(&self, line_no: usize, diff_line_content: &str) -> Option<String> {
+        if line_no == 0 || line_no > self.line_spans.len() {
+            return None;
+        }
+        let (lstart, lend) = self.line_spans[line_no - 1];
+        let disk_line = &self.source[lstart..lend];
+        if disk_line != diff_line_content.trim_end_matches('\r') {
+            return None;
+        }
+
+        let idx = self.string_ranges.partition_point(|&(_, rend)| rend <= lstart);
+        if idx >= self.string_ranges.len() || self.string_ranges[idx].0 >= lend {
+            return Some(disk_line.trim().to_string());
+        }
+
+        let mut out = String::with_capacity(lend - lstart);
+        let mut cursor = lstart;
+        for &(rstart, rend) in &self.string_ranges[idx..] {
+            if rstart >= lend {
+                break;
+            }
+            let seg_start = rstart.max(lstart);
+            if seg_start > cursor {
+                out.push_str(&self.source[cursor..seg_start]);
+            }
+            out.push(' ');
+            cursor = cursor.max(rend.min(lend));
+            if cursor >= lend {
+                break;
+            }
+        }
+        if cursor < lend {
+            out.push_str(&self.source[cursor..lend]);
+        }
+        Some(out.trim().to_string())
+    }
+}
+
+fn collect_string_ranges(lang: Lang, node: Node, out: &mut Vec<(usize, usize)>) {
+    let kind = node.kind();
+    let is_string = match lang {
+        Lang::Python => kind == "string",
+        Lang::Rust => kind == "string_literal" || kind == "raw_string_literal",
+        Lang::JavaScript | Lang::TypeScript => kind == "string" || kind == "template_string",
+        Lang::Go => kind == "interpreted_string_literal" || kind == "raw_string_literal",
+    };
+
+    if is_string {
+        let mut interps = Vec::new();
+        if matches!(lang, Lang::Python | Lang::JavaScript | Lang::TypeScript) {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if matches!(child.kind(), "interpolation" | "template_substitution") {
+                    interps.push(child);
+                }
+            }
+        }
+        if interps.is_empty() {
+            out.push((node.start_byte(), node.end_byte()));
+        } else {
+            let mut cur = node.start_byte();
+            for interp in interps {
+                if interp.start_byte() > cur {
+                    out.push((cur, interp.start_byte()));
+                }
+                collect_string_ranges(lang, interp, out);
+                cur = interp.end_byte();
+            }
+            if node.end_byte() > cur {
+                out.push((cur, node.end_byte()));
+            }
+        }
+        return;
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_string_ranges(lang, child, out);
+    }
 }
 
 /// Replace string literal contents with empty quotes so regex-based code checks

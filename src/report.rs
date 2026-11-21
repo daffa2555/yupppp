@@ -49,15 +49,63 @@ pub struct Report {
     pub blast_radius: Vec<BlastEntry>,
 }
 
+struct AnsiPalette {
+    reset: &'static str,
+    bold: &'static str,
+    dim: &'static str,
+    bold_red: &'static str,
+    bold_green: &'static str,
+    bold_yellow: &'static str,
+    bold_cyan: &'static str,
+    yellow: &'static str,
+}
+
+impl AnsiPalette {
+    fn new(use_color: bool) -> Self {
+        if use_color {
+            Self {
+                reset: "\x1b[0m",
+                bold: "\x1b[1m",
+                dim: "\x1b[2m",
+                bold_red: "\x1b[1;31m",
+                bold_green: "\x1b[1;32m",
+                bold_yellow: "\x1b[1;33m",
+                bold_cyan: "\x1b[1;36m",
+                yellow: "\x1b[33m",
+            }
+        } else {
+            Self {
+                reset: "",
+                bold: "",
+                dim: "",
+                bold_red: "",
+                bold_green: "",
+                bold_yellow: "",
+                bold_cyan: "",
+                yellow: "",
+            }
+        }
+    }
+}
+
 pub fn render_terminal(report: &Report, use_emoji: bool) -> String {
+    render_terminal_with_color(report, use_emoji, false)
+}
+
+pub fn render_terminal_with_color(report: &Report, use_emoji: bool, use_color: bool) -> String {
+    let p = AnsiPalette::new(use_color);
     let mut out = String::new();
     out.push_str(&format!(
-        "yupp v{} · scanned {} files (+{} -{}) in {}ms (0-LLM · Tree-sitter AST)\n",
+        "{}yupp v{}{} {}· scanned {} files (+{} -{}) in {}ms (0-LLM · Tree-sitter AST){}\n",
+        p.bold,
         report.version,
+        p.reset,
+        p.dim,
         report.files_scanned,
         report.lines_added,
         report.lines_removed,
-        report.elapsed_ms
+        report.elapsed_ms,
+        p.reset
     ));
 
     let breaking: Vec<&Finding> = report
@@ -67,17 +115,25 @@ pub fn render_terminal(report: &Report, use_emoji: bool) -> String {
         .collect();
     if !breaking.is_empty() {
         out.push_str(&format!(
-            "\n[BREAKING CHANGES] {} finding(s)\n",
+            "\n{}[BREAKING CHANGES]{} {} finding(s)\n",
+            p.bold_yellow,
+            p.reset,
             breaking.len()
         ));
         for (i, f) in breaking.iter().enumerate() {
             out.push_str(&format!(
-                "  {}. {}:{}  {} [{}]\n",
+                "  {}{}.{} {}{}:{}{}  {} {}[{}]{}\n",
+                p.dim,
                 i + 1,
+                p.reset,
+                p.bold,
                 f.file,
                 f.line,
+                p.reset,
                 f.message,
-                f.rule
+                p.dim,
+                f.rule,
+                p.reset
             ));
         }
     }
@@ -88,15 +144,26 @@ pub fn render_terminal(report: &Report, use_emoji: bool) -> String {
         .filter(|f| f.category == Category::TestTheater)
         .collect();
     if !theater.is_empty() {
-        out.push_str(&format!("\n[TEST THEATER] {} finding(s)\n", theater.len()));
+        out.push_str(&format!(
+            "\n{}[TEST THEATER]{} {} finding(s)\n",
+            p.bold_red,
+            p.reset,
+            theater.len()
+        ));
         for (i, f) in theater.iter().enumerate() {
             out.push_str(&format!(
-                "  {}. {}:{}  {} [{}]\n",
+                "  {}{}.{} {}{}:{}{}  {} {}[{}]{}\n",
+                p.dim,
                 i + 1,
+                p.reset,
+                p.bold,
                 f.file,
                 f.line,
+                p.reset,
                 f.message,
-                f.rule
+                p.dim,
+                f.rule,
+                p.reset
             ));
         }
     }
@@ -107,22 +174,35 @@ pub fn render_terminal(report: &Report, use_emoji: bool) -> String {
         .filter(|f| f.category == Category::SecretLeak)
         .collect();
     if !secrets.is_empty() {
-        out.push_str(&format!("\n[SECRET LEAK] {} blocker(s)\n", secrets.len()));
+        out.push_str(&format!(
+            "\n{}[SECRET LEAK]{} {} blocker(s)\n",
+            p.bold_red,
+            p.reset,
+            secrets.len()
+        ));
         for (i, f) in secrets.iter().enumerate() {
             out.push_str(&format!(
-                "  {}. {}:{}  {} [{}]\n",
+                "  {}{}.{} {}{}:{}{}  {} {}[{}]{}\n",
+                p.dim,
                 i + 1,
+                p.reset,
+                p.bold,
                 f.file,
                 f.line,
+                p.reset,
                 f.message,
-                f.rule
+                p.dim,
+                f.rule,
+                p.reset
             ));
         }
     }
 
     if !report.blast_radius.is_empty() {
         out.push_str(&format!(
-            "\n[BLAST RADIUS] {} modified symbol(s) with cross-file callers\n",
+            "\n{}[BLAST RADIUS]{} {} modified symbol(s) with cross-file callers\n",
+            p.bold_cyan,
+            p.reset,
             report.blast_radius.len()
         ));
         for b in &report.blast_radius {
@@ -141,19 +221,29 @@ pub fn render_terminal(report: &Report, use_emoji: bool) -> String {
                 })
                 .collect();
             let has_test = b.callers.iter().any(|c| c.is_test);
-            let cov = if has_test { "" } else { " [NO TEST CALLER]" };
+            let cov = if has_test {
+                String::new()
+            } else {
+                format!(" {}[NO TEST CALLER]{}", p.yellow, p.reset)
+            };
             let sig = match &b.signature_change {
-                Some(s) => format!(" [SIG CHANGED: {}]", s),
+                Some(s) => format!(" {}[SIG CHANGED: {}]{}", p.bold_yellow, s, p.reset),
                 None => String::new(),
             };
             out.push_str(&format!(
-                "  • {}:{} ({} callers){}{}\n    ↳ {}\n",
+                "  • {}{}:{}{} {}({} callers){}{}{}\n    {}↳ {}{}\n",
+                p.bold,
                 b.file,
                 b.symbol,
+                p.reset,
+                p.dim,
                 b.callers.len(),
+                p.reset,
                 cov,
                 sig,
-                caller_list.join(", ")
+                p.dim,
+                caller_list.join(", "),
+                p.reset
             ));
         }
     }
@@ -165,17 +255,25 @@ pub fn render_terminal(report: &Report, use_emoji: bool) -> String {
         .collect();
     if !slop.is_empty() {
         out.push_str(&format!(
-            "\n[SILENT SLOP & HAZARDS] {} finding(s)\n",
+            "\n{}[SILENT SLOP & HAZARDS]{} {} finding(s)\n",
+            p.bold_yellow,
+            p.reset,
             slop.len()
         ));
         for (i, f) in slop.iter().enumerate() {
             out.push_str(&format!(
-                "  {}. {}:{}  {} [{}]\n",
+                "  {}{}.{} {}{}:{}{}  {} {}[{}]{}\n",
+                p.dim,
                 i + 1,
+                p.reset,
+                p.bold,
                 f.file,
                 f.line,
+                p.reset,
                 f.message,
-                f.rule
+                p.dim,
+                f.rule,
+                p.reset
             ));
         }
     }
@@ -183,16 +281,43 @@ pub fn render_terminal(report: &Report, use_emoji: bool) -> String {
     out.push('\n');
     let label = report.verdict.label(use_emoji);
     match report.verdict {
-        Verdict::Yupp | Verdict::Hmm => {
+        Verdict::Yupp => {
             out.push_str(&format!(
-                "{}  ({} blockers, {} warnings · {}ms)\n",
-                label, report.blockers, report.warnings, report.elapsed_ms
+                "{}{}{}  {}({} blockers, {} warnings · {}ms){}\n",
+                p.bold_green,
+                label,
+                p.reset,
+                p.dim,
+                report.blockers,
+                report.warnings,
+                report.elapsed_ms,
+                p.reset
+            ));
+        }
+        Verdict::Hmm => {
+            out.push_str(&format!(
+                "{}{}{}  {}({} blockers, {} warnings · {}ms){}\n",
+                p.bold_yellow,
+                label,
+                p.reset,
+                p.dim,
+                report.blockers,
+                report.warnings,
+                report.elapsed_ms,
+                p.reset
             ));
         }
         Verdict::Nope => {
             out.push_str(&format!(
-                "{}  ({} blockers, {} warnings · {}ms · exit 1)\n",
-                label, report.blockers, report.warnings, report.elapsed_ms
+                "{}{}{}  {}({} blockers, {} warnings · {}ms · exit 1){}\n",
+                p.bold_red,
+                label,
+                p.reset,
+                p.dim,
+                report.blockers,
+                report.warnings,
+                report.elapsed_ms,
+                p.reset
             ));
         }
     }

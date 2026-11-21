@@ -1,0 +1,107 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package Unix archive
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          if [[ "$TAG" != v* ]]; then
+            TAG="v$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          fi
+          STAGE="yupp-${TAG}-${{ matrix.target }}"
+          mkdir -p dist "$STAGE"
+          cp "target/${{ matrix.target }}/release/yupp" "$STAGE/yupp"
+          cp LICENSE README.md "$STAGE/"
+          tar -C "$STAGE" -czf "dist/yupp-${TAG}-${{ matrix.target }}.tar.gz" yupp LICENSE README.md
+
+      - name: Package Windows archive
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $Tag = $env:GITHUB_REF_NAME
+          if (-not $Tag.StartsWith("v")) {
+            $Meta = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+            $Tag = "v" + $Meta.packages[0].version
+          }
+          $Stage = "yupp-$Tag-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path dist, $Stage | Out-Null
+          Copy-Item "target\${{ matrix.target }}\release\yupp.exe" "$Stage\yupp.exe"
+          Copy-Item LICENSE, README.md "$Stage\"
+          Compress-Archive -Path "$Stage\*" -DestinationPath "dist\yupp-$Tag-${{ matrix.target }}.zip"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: yupp-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate SHA-256 checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          LC_ALL=C sha256sum yupp-* | sort -k2 > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: release-assets/*

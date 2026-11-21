@@ -48,14 +48,17 @@ yupp v0.1.0 · scanned 2 files (+9 -4) in 11ms (0-LLM · Tree-sitter AST)
 nope ❌  (3 blockers, 0 warnings · 11ms · exit 1)
 ```
 
-*(Need plain ASCII for CI logs? Pass `--no-emoji` or set `NO_COLOR=1` → `yupp [OK]` / `hmm [WARN]` / `nope [FAIL]`.)*
+*(Need plain ASCII or uncolored CI logs? ANSI colors automatically disable on non-TTY pipes or `NO_COLOR=1`, or pass `--no-color` / `--color always|auto|never` and `--no-emoji` → `yupp [OK]` / `hmm [WARN]` / `nope [FAIL]`.)*
 
 ---
 
 ## Quick Start
 
 ```bash
-# Install from GitHub
+# 1-line install (Linux x86_64, macOS arm64/x86_64 · verifies SHA-256)
+curl -fsSL https://raw.githubusercontent.com/daffa2555/yupppp/main/install.sh | sh
+
+# Or install from source via Cargo
 cargo install --git https://github.com/daffa2555/yupppp
 
 # Scan branch diff before opening a PR

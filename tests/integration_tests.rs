@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use yupp::ast::{analyze_diff_with_options, AnalyzeOptions, Severity};
 use yupp::config::{init_config, Config, SeverityOverride};
-use yupp::diff::{parse_unified_diff, resolve_base_ref};
+use yupp::diff::{parse_unified_diff, resolve_base_ref, resolve_head_ref};
 use yupp::mcp::run_mcp_io;
-use yupp::report::{render_sarif, render_terminal, Report, Verdict};
+use yupp::report::{render_sarif, render_terminal, render_terminal_with_color, Report, Verdict};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -83,6 +83,7 @@ fn breaking_signature_change_with_unupdated_caller_is_conservative_warning() {
     let files = parse_unified_diff(&raw_diff);
     let opts = AnalyzeOptions {
         base_ref: resolve_base_ref(None, false, &dir),
+        head_ref: None,
         config: Config::default(),
     };
     let (findings, blast) = analyze_diff_with_options(&files, &dir, &opts);
@@ -137,6 +138,7 @@ fn breaking_signature_change_when_caller_updated_in_pr_is_not_blocker() {
     let files = parse_unified_diff(&raw_diff);
     let opts = AnalyzeOptions {
         base_ref: Some("HEAD".into()),
+        head_ref: None,
         config: Config::default(),
     };
     let (findings, blast) = analyze_diff_with_options(&files, &dir, &opts);
@@ -175,6 +177,7 @@ fn adding_optional_default_param_in_python_is_not_breaking() {
     let files = parse_unified_diff(&raw_diff);
     let opts = AnalyzeOptions {
         base_ref: Some("HEAD".into()),
+        head_ref: None,
         config: Config::default(),
     };
     let (findings, _) = analyze_diff_with_options(&files, &dir, &opts);
@@ -216,6 +219,7 @@ fn removed_public_symbol_with_unupdated_caller_is_conservative_warning() {
     let files = parse_unified_diff(&raw_diff);
     let opts = AnalyzeOptions {
         base_ref: Some("HEAD".into()),
+        head_ref: None,
         config: Config::default(),
     };
     let (findings, _) = analyze_diff_with_options(&files, &dir, &opts);
@@ -879,6 +883,7 @@ fn generic_method_names_do_not_emit_noisy_breaking_or_blast_radius_false_positiv
     let files = parse_unified_diff(&raw_diff);
     let opts = AnalyzeOptions {
         base_ref: Some("HEAD".into()),
+        head_ref: None,
         config: Config::default(),
     };
     let (findings, blast) = analyze_diff_with_options(&files, &dir, &opts);
@@ -1252,6 +1257,532 @@ fn comprehensive_test_theater_across_python_ts_rust_go() {
     assert!(findings.iter().any(|f| f.file == "tests/empty_test.go" && f.rule == "test-theater/skipped-test"));
     assert!(findings.iter().any(|f| f.file == "tests/rust_test.rs" && f.rule == "test-theater/skipped-test"));
     assert!(findings.iter().any(|f| f.file == "tests/rust_test.rs" && f.rule == "test-theater/trivial-assertion"));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+// =========================================================================
+// Polish & Edge Cases: ANSI Colors, Whole-File Deletions, Multiline Strings
+// =========================================================================
+
+#[test]
+fn cli_ansi_color_flags_and_tty_auto_disable() {
+    let dir = make_temp_dir("cli-color");
+    fs::create_dir_all(dir.join("src")).unwrap();
+    fs::write(
+        dir.join("src/parse.rs"),
+        "pub fn parse_num(s: &str) -> i32 {\n    s.parse().unwrap()\n}\n",
+    )
+    .unwrap();
+    fs::create_dir_all(dir.join("tests")).unwrap();
+    fs::write(
+        dir.join("tests/parse_test.rs"),
+        "#[test]\nfn test_parse_num() { assert_eq!(parse_num(\"1\"), 1); }\n",
+    )
+    .unwrap();
+
+    let warn_diff = "\
++++ b/src/parse.rs
+@@ -1,1 +1,3 @@
++pub fn parse_num(s: &str) -> i32 {
++    s.parse().unwrap()
++}
+";
+
+    // 1. Piped stdout (non-TTY) with default --color auto => NO ANSI codes
+    let mut child = Command::new(yupp_bin())
+        .args(["--stdin", "--repo"])
+        .arg(&dir)
+        .env_remove("NO_COLOR")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(warn_diff.as_bytes())
+        .unwrap();
+    let out_auto = child.wait_with_output().unwrap();
+    assert!(out_auto.status.success());
+    let auto_str = String::from_utf8_lossy(&out_auto.stdout);
+    assert!(!auto_str.contains("\x1b["), "expected no ANSI in piped auto mode: {}", auto_str);
+    assert!(auto_str.contains("hmm 🤔"));
+
+    // 2. --color always => ANSI yellow verdict + bold file:line + dimmed rule
+    let mut child = Command::new(yupp_bin())
+        .args(["--stdin", "--color", "always", "--repo"])
+        .arg(&dir)
+        .env_remove("NO_COLOR")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(warn_diff.as_bytes())
+        .unwrap();
+    let out_always = child.wait_with_output().unwrap();
+    assert!(out_always.status.success());
+    let always_str = String::from_utf8_lossy(&out_always.stdout);
+    assert!(always_str.contains("\x1b[1;33mhmm 🤔\x1b[0m"), "got: {}", always_str);
+    assert!(always_str.contains("\x1b[1msrc/parse.rs:2\x1b[0m"), "got: {}", always_str);
+    assert!(always_str.contains("\x1b[2m[slop/rust-unwrap]\x1b[0m"), "got: {}", always_str);
+
+    // 3. --color always --no-color => NO ANSI codes
+    let mut child = Command::new(yupp_bin())
+        .args(["--stdin", "--color", "always", "--no-color", "--repo"])
+        .arg(&dir)
+        .env_remove("NO_COLOR")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(warn_diff.as_bytes())
+        .unwrap();
+    let out_no_color = child.wait_with_output().unwrap();
+    let no_color_str = String::from_utf8_lossy(&out_no_color.stdout);
+    assert!(!no_color_str.contains("\x1b["), "expected no ANSI with --no-color: {}", no_color_str);
+
+    // 4. --color never => NO ANSI codes
+    let mut child = Command::new(yupp_bin())
+        .args(["--stdin", "--color", "never", "--repo"])
+        .arg(&dir)
+        .env_remove("NO_COLOR")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(warn_diff.as_bytes())
+        .unwrap();
+    let out_never = child.wait_with_output().unwrap();
+    let never_str = String::from_utf8_lossy(&out_never.stdout);
+    assert!(!never_str.contains("\x1b["), "expected no ANSI with --color never: {}", never_str);
+
+    // 5. NO_COLOR=1 with default --color auto => NO ANSI codes + ASCII verdict
+    let mut child = Command::new(yupp_bin())
+        .args(["--stdin", "--repo"])
+        .arg(&dir)
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(warn_diff.as_bytes())
+        .unwrap();
+    let out_env = child.wait_with_output().unwrap();
+    let env_str = String::from_utf8_lossy(&out_env.stdout);
+    assert!(!env_str.contains("\x1b["), "expected no ANSI with NO_COLOR=1: {}", env_str);
+    assert!(env_str.contains("hmm [WARN]"), "got: {}", env_str);
+
+    // 6. Direct library check for green yupp / red nope styling via render_terminal_with_color
+    let clean_report = Report {
+        version: "0.1.0",
+        verdict: Verdict::Yupp,
+        passed: true,
+        files_scanned: 1,
+        lines_added: 1,
+        lines_removed: 0,
+        elapsed_ms: 1,
+        blockers: 0,
+        warnings: 0,
+        findings: vec![],
+        blast_radius: vec![],
+    };
+    assert!(render_terminal_with_color(&clean_report, true, true).contains("\x1b[1;32myupp 👌\x1b[0m"));
+    assert!(!render_terminal_with_color(&clean_report, true, false).contains("\x1b["));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn deleted_file_with_public_symbols_surfaces_breaking_symbol_removed_and_callers() {
+    let dir = make_temp_dir("whole-file-delete");
+    init_git_repo(&dir);
+    fs::create_dir_all(dir.join("src")).unwrap();
+
+    fs::write(
+        dir.join("src/legacy_billing.py"),
+        "def compute_loyalty_discount(amount: float) -> float:\n    return amount * 0.9\n\ndef _internal_helper():\n    return 1\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("src/checkout.py"),
+        "from src.legacy_billing import compute_loyalty_discount\n\ndef finalize_order(total):\n    return compute_loyalty_discount(total)\n",
+    )
+    .unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-m", "initial billing"]);
+
+    // Delete the entire file in working tree without updating src/checkout.py
+    fs::remove_file(dir.join("src/legacy_billing.py")).unwrap();
+
+    let raw_diff = git(&dir, &["diff", "--unified=3"]);
+    let files = parse_unified_diff(&raw_diff);
+    assert_eq!(files.len(), 1, "expected deleted file to be parsed from diff");
+    assert_eq!(files[0].path, "src/legacy_billing.py");
+    assert!(files[0].is_deleted);
+    assert!(files[0].added.is_empty());
+    assert!(!files[0].removed.is_empty());
+
+    // 1. With git base_ref resolved
+    let base_ref = resolve_base_ref(None, false, &dir);
+    let opts = AnalyzeOptions {
+        base_ref,
+        head_ref: None,
+        config: Config::default(),
+    };
+    let (findings, blast) = analyze_diff_with_options(&files, &dir, &opts);
+
+    let removed_finding = findings
+        .iter()
+        .find(|f| f.rule == "breaking/public-symbol-removed")
+        .expect("expected breaking/public-symbol-removed for deleted file");
+    assert_eq!(removed_finding.severity, Severity::Warning);
+    assert_eq!(removed_finding.file, "src/legacy_billing.py");
+    assert!(
+        removed_finding.message.contains("compute_loyalty_discount"),
+        "got: {}",
+        removed_finding.message
+    );
+    assert!(
+        removed_finding.message.contains("src/checkout.py"),
+        "expected unupdated caller src/checkout.py in message, got: {}",
+        removed_finding.message
+    );
+    assert!(
+        !findings.iter().any(|f| f.message.contains("_internal_helper")),
+        "private symbol should not emit breaking/public-symbol-removed"
+    );
+    assert!(
+        blast
+            .iter()
+            .any(|b| b.symbol == "compute_loyalty_discount"
+                && b.unupdated_callers.contains(&"src/checkout.py".to_string())),
+        "expected blast radius with unupdated caller, got: {:?}",
+        blast
+    );
+
+    // 2. Also verify fallback when base_ref is None (e.g. piped --stdin without git range)
+    let (stdin_findings, _) =
+        analyze_diff_with_options(&files, &dir, &AnalyzeOptions::default());
+    assert!(
+        stdin_findings
+            .iter()
+            .any(|f| f.rule == "breaking/public-symbol-removed"
+                && f.message.contains("compute_loyalty_discount")
+                && f.message.contains("src/checkout.py")),
+        "expected deleted-file fallback to catch removed public symbol without base_ref: {:?}",
+        stdin_findings
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn multiline_string_literals_do_not_trigger_slop_false_positives_across_languages() {
+    let dir = make_temp_dir("multiline-strings");
+    fs::create_dir_all(dir.join("src")).unwrap();
+    fs::create_dir_all(dir.join("tests")).unwrap();
+
+    let fake_stripe = format!("sk_{}_{}", "live", "99A8b7C6d5E4f3G2h1J0k9L8");
+
+    // Python: triple-double & triple-single docstrings with slop-like text,
+    // plus a real secret inside a multiline string (which MUST still be caught).
+    let py_src = format!(
+        r#"def render_docs():
+    doc = """
+    Example snippets:
+    todo!()
+    console.log("hello")
+    breakpoint()
+    # TODO: implement this
+    # type: ignore
+    """
+    alt = '''
+    NotImplementedError
+    pdb.set_trace()
+    '''
+    leaked = """
+    token = {}
+    """
+    return doc + alt + leaked
+"#,
+        fake_stripe
+    );
+
+    // Rust: multiline raw string r#"..."# with slop-like text,
+    // plus a real `.unwrap()` AFTER the closing `"#` on the closing line (MUST be caught).
+    let rs_src = r##"pub fn build_prompt() -> usize {
+    let template = r#"
+    fn fake() {
+        let v = x.unwrap();
+        todo!();
+        unimplemented!();
+        dbg!(v);
+        // TODO: implement logic
+        #[allow(warnings)]
+    }
+    "#;
+    let parsed: usize = r#"
+    todo!()
+    "#.trim().len().checked_add(1).unwrap();
+    template.len() + parsed
+}
+"##;
+
+    // TypeScript: multiline template literal with slop-like text on interior lines,
+    // plus a real `console.log` inside `${...}` interpolation (MUST be caught).
+    let ts_src = r#"export function buildTemplate(name: string): string {
+  const msg = `
+    console.log("just documentation text");
+    debugger;
+    // @ts-ignore
+    // TODO: implement here
+    ${console.log("real debug in interpolation")}
+  `;
+  return msg + name;
+}
+"#;
+
+    // Go: multiline backtick raw string with fmt.Println & placeholder comment
+    let go_src = r#"package docs
+
+func RenderGoHelp() string {
+	return `
+	fmt.Println("example output")
+	// TODO: implement this
+	`
+}
+"#;
+
+    fs::write(dir.join("src/docs.py"), &py_src).unwrap();
+    fs::write(dir.join("src/prompt.rs"), rs_src).unwrap();
+    fs::write(dir.join("src/tmpl.ts"), ts_src).unwrap();
+    fs::write(dir.join("src/help.go"), go_src).unwrap();
+    // Add test references so untested-new-public does not clutter findings
+    fs::write(
+        dir.join("tests/test_all.py"),
+        "def test_refs():\n    assert render_docs and build_prompt and buildTemplate and RenderGoHelp\n",
+    )
+    .unwrap();
+
+    fn make_added_diff(path: &str, src: &str) -> String {
+        let lines: Vec<&str> = src.lines().collect();
+        let mut s = format!("+++ b/{}\n@@ -0,0 +1,{} @@\n", path, lines.len());
+        for l in lines {
+            s.push('+');
+            s.push_str(l);
+            s.push('\n');
+        }
+        s
+    }
+
+    let raw_diff = format!(
+        "{}{}{}{}",
+        make_added_diff("src/docs.py", &py_src),
+        make_added_diff("src/prompt.rs", rs_src),
+        make_added_diff("src/tmpl.ts", ts_src),
+        make_added_diff("src/help.go", go_src),
+    );
+
+    let files = parse_unified_diff(&raw_diff);
+    let (findings, _) = analyze_diff_with_options(&files, &dir, &AnalyzeOptions::default());
+
+    // Python: zero slop findings, but secret inside multiline string IS caught
+    assert!(
+        !findings
+            .iter()
+            .any(|f| f.file == "src/docs.py" && f.rule.starts_with("slop/")),
+        "unexpected slop false positives in Python multiline strings: {:?}",
+        findings
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.file == "src/docs.py" && f.rule == "secret/stripe"),
+        "secret inside Python multiline string must still be caught: {:?}",
+        findings
+    );
+
+    // Rust: no false positive for todo!/dbg!/allow/unwrap inside r#"..."#,
+    // ONLY the real `.unwrap()` after closing `"#` on line 14 is flagged.
+    let rs_findings: Vec<_> = findings
+        .iter()
+        .filter(|f| f.file == "src/prompt.rs")
+        .collect();
+    assert_eq!(
+        rs_findings.len(),
+        1,
+        "expected exactly 1 finding (the real .unwrap() after closing \"#), got: {:?}",
+        rs_findings
+    );
+    assert_eq!(rs_findings[0].rule, "slop/rust-unwrap");
+    assert_eq!(rs_findings[0].line, 14);
+
+    // TypeScript: no false positives for interior template literal lines,
+    // ONLY the real console.log inside `${...}` on line 7 is flagged.
+    let ts_findings: Vec<_> = findings
+        .iter()
+        .filter(|f| f.file == "src/tmpl.ts")
+        .collect();
+    assert_eq!(
+        ts_findings.len(),
+        1,
+        "expected exactly 1 finding (real console.log inside template interpolation), got: {:?}",
+        ts_findings
+    );
+    assert_eq!(ts_findings[0].rule, "slop/debug-leftover");
+    assert_eq!(ts_findings[0].line, 7);
+
+    // Go: zero slop findings for interior lines of backtick raw string
+    assert!(
+        !findings
+            .iter()
+            .any(|f| f.file == "src/help.go" && f.rule.starts_with("slop/")),
+        "unexpected slop false positives in Go raw string: {:?}",
+        findings
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn parse_unified_diff_preserves_hunk_lines_matching_diff_headers() {
+    let raw_diff = "\
+diff --git a/src/fixture.rs b/src/fixture.rs
+index 1111111..2222222 100644
+--- a/src/fixture.rs
++++ b/src/fixture.rs
+@@ -1,3 +1,6 @@
+ pub fn sample() -> &'static str {
+-    \"-- a/old.rs\"
++-- a/removed_header.rs
++++ b/fake_header.rs
++++ /dev/null
++    \"ok\"
+ }
+";
+    let files = parse_unified_diff(raw_diff);
+    assert_eq!(files.len(), 1, "hunk lines starting with +++/--- must not split files: {:?}", files);
+    assert_eq!(files[0].path, "src/fixture.rs");
+    assert!(!files[0].is_deleted);
+    assert_eq!(files[0].added.len(), 4);
+    assert_eq!(files[0].removed.len(), 1);
+    assert_eq!(files[0].added[1].content, "++ b/fake_header.rs");
+    assert_eq!(files[0].added[2].content, "++ /dev/null");
+}
+
+#[test]
+fn multiline_strings_masked_in_historical_commit_range_and_staged_diff() {
+    assert_eq!(resolve_head_ref(None, false), None);
+    assert_eq!(resolve_head_ref(None, true), Some(String::new()));
+    assert_eq!(resolve_head_ref(Some("HEAD~2..HEAD~1"), false), Some("HEAD~1".into()));
+    assert_eq!(resolve_head_ref(Some("main...feature"), false), Some("feature".into()));
+    assert_eq!(resolve_head_ref(Some("HEAD~1"), false), None);
+
+    let dir = make_temp_dir("multiline-range-staged");
+    init_git_repo(&dir);
+    fs::create_dir_all(dir.join("src")).unwrap();
+    fs::create_dir_all(dir.join("tests")).unwrap();
+
+    fs::write(dir.join("src/doc.py"), "def render_help():\n    return ''\n").unwrap();
+    fs::write(
+        dir.join("tests/test_doc.py"),
+        "def test_render_help():\n    assert render_help() is not None\n",
+    )
+    .unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-m", "initial"]);
+
+    // Commit 1: add multiline docstring containing slop-like text
+    fs::write(
+        dir.join("src/doc.py"),
+        "def render_help():\n    return \"\"\"\n    todo!()\n    breakpoint()\n    # TODO: implement this\n    \"\"\"\n",
+    )
+    .unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-m", "add docstring"]);
+
+    // Commit 2: shift all lines down by 3 in working tree / HEAD
+    fs::write(
+        dir.join("src/doc.py"),
+        "# line 1\n# line 2\n# line 3\ndef render_help():\n    return \"\"\"\n    todo!()\n    breakpoint()\n    # TODO: implement this\n    \"\"\"\n",
+    )
+    .unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-m", "shift lines"]);
+
+    // 1. Scanning historical range HEAD~2..HEAD~1 must read HEAD~1 (not HEAD on disk)
+    let out_range = Command::new(yupp_bin())
+        .args(["HEAD~2..HEAD~1", "--repo", &dir.to_string_lossy(), "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(out_range.status.success(), "stderr: {}", String::from_utf8_lossy(&out_range.stderr));
+    let j_range: Value = serde_json::from_slice(&out_range.stdout).unwrap();
+    let range_slop: Vec<&Value> = j_range["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["rule"].as_str().unwrap_or("").starts_with("slop/"))
+        .collect();
+    assert!(
+        range_slop.is_empty(),
+        "expected 0 slop findings in historical range HEAD~2..HEAD~1, got: {:?}",
+        range_slop
+    );
+
+    // 2. Stage a multiline string change, then shift lines in the unstaged working tree
+    fs::write(
+        dir.join("src/doc.py"),
+        "# line 1\n# line 2\n# line 3\ndef render_help():\n    return \"\"\"\n    todo!()\n    breakpoint()\n    console.log(\"staged\")\n    \"\"\"\n",
+    )
+    .unwrap();
+    git(&dir, &["add", "src/doc.py"]);
+    // Modify working tree without staging so working-tree line numbers diverge from index
+    fs::write(
+        dir.join("src/doc.py"),
+        "# extra 1\n# extra 2\n# line 1\n# line 2\n# line 3\ndef render_help():\n    return \"\"\"\n    todo!()\n    breakpoint()\n    console.log(\"staged\")\n    \"\"\"\n",
+    )
+    .unwrap();
+
+    let out_staged = Command::new(yupp_bin())
+        .args(["--staged", "--repo", &dir.to_string_lossy(), "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(out_staged.status.success(), "stderr: {}", String::from_utf8_lossy(&out_staged.stderr));
+    let j_staged: Value = serde_json::from_slice(&out_staged.stdout).unwrap();
+    let staged_slop: Vec<&Value> = j_staged["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["rule"].as_str().unwrap_or("").starts_with("slop/"))
+        .collect();
+    assert!(
+        staged_slop.is_empty(),
+        "expected 0 slop findings in --staged diff with shifted working tree, got: {:?}",
+        staged_slop
+    );
 
     let _ = fs::remove_dir_all(dir);
 }
