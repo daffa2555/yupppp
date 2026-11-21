@@ -114,7 +114,7 @@ Exposed MCP tools:
   - Empty test functions with 0 assertions (`test-theater/empty-test`)
   - Tautology assertions like `assert True` / `expect(true).toBe(true)` (`test-theater/trivial-assertion`)
   - Added `.skip`, `xit`, `@pytest.mark.skip`, `#[ignore]`, `t.Skip()` (`test-theater/skipped-test`)
-  - **Diff-aware mock-testing-mock** (`test-theater/mock-testing-mock`): flags tests that mock the exact symbol/module changed in the diff with only mock-call assertions (never falsely flags legitimate dependency injection mocks)
+  - **Diff-aware mock-testing-mock** (`test-theater/mock-testing-mock`): flags tests that mock the exact symbol/module changed in the diff with only mock-call assertions (designed to avoid flagging legitimate dependency injection mocks)
   - Newly added public/exported functions with 0 test references (`test-theater/untested-new-api`)
 - **AI-Specific Slop & Escape Hatches (Warnings):**
   - Stub/placeholder functions (`pass`, `...`, `todo!()`, `unimplemented!()`, `// implement logic here`)
@@ -148,3 +148,7 @@ See [examples/github-action.yml](examples/github-action.yml) for a drop-in PR co
 ## License
 
 [MIT](LICENSE)
+
+---
+
+*Built for fun to keep AI coding agents honest on local diffs (v0.1.0 — feedback and edge cases welcome).*
