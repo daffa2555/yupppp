@@ -113,6 +113,15 @@ struct Cli {
     no_color: bool,
 }
 
+fn is_git_work_tree(repo: &std::path::Path) -> bool {
+    Command::new("git")
+        .current_dir(repo)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "true")
+        .unwrap_or(false)
+}
+
 fn read_diff(cli: &Cli) -> Result<String, String> {
     if cli.stdin {
         let mut buf = String::new();
@@ -120,6 +129,17 @@ fn read_diff(cli: &Cli) -> Result<String, String> {
             .read_to_string(&mut buf)
             .map_err(|e| format!("failed to read stdin: {}", e))?;
         return Ok(buf);
+    }
+
+    if !is_git_work_tree(&cli.repo) {
+        let abs = cli
+            .repo
+            .canonicalize()
+            .unwrap_or_else(|_| cli.repo.clone());
+        return Err(format!(
+            "not a git repository ({})\nhint: run `yupp` inside a git repo, pass `--repo <path>`, or pipe a diff via `yupp --stdin`",
+            abs.display()
+        ));
     }
 
     let mut cmd = Command::new("git");

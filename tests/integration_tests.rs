@@ -1990,3 +1990,31 @@ fn git_show_files_batch_fetches_multiple_revisions_and_ignores_missing_blobs() {
 
     let _ = fs::remove_dir_all(dir);
 }
+
+#[test]
+fn cli_outside_git_repo_prints_clean_hint_instead_of_git_usage_spam() {
+    let dir = make_temp_dir("non-git-dir");
+    let out = Command::new(yupp_bin())
+        .args(["--repo", &dir.to_string_lossy()])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("not a git repository"),
+        "expected clean non-git error, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("hint: run `yupp` inside a git repo"),
+        "expected helpful hint, got: {}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("Diff output format options"),
+        "must not dump raw git diff usage spam: {}",
+        stderr
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
