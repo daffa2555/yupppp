@@ -5,8 +5,11 @@ edition = "2021"
 description = "0-LLM Rust CLI that catches AI test theater, silent slop, and PR blast radius in milliseconds"
 license = "MIT"
 readme = "README.md"
+repository = "https://github.com/daffa2555/yupppp"
+homepage = "https://github.com/daffa2555/yupppp"
 keywords = ["cli", "git", "diff", "code-review", "tree-sitter"]
 categories = ["command-line-utilities", "development-tools"]
+exclude = ["assets/**", ".github/**"]
 
 [dependencies]
 clap = { version = "4.6", features = ["derive"] }
