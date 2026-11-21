@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/banner.jpg" alt="yupp — 0-LLM Rust PR X-Ray & Test Theater Detector" width="100%" />
+  <img src="https://raw.githubusercontent.com/daffa2555/yupppp/main/assets/banner.jpg" alt="yupp — 0-LLM Rust PR X-Ray & Test Theater Detector" width="100%" />
 </p>
 
 # yupp 👌
@@ -60,6 +60,9 @@ curl -fsSL https://raw.githubusercontent.com/daffa2555/yupppp/main/install.sh | 
 
 # Or install from crates.io via Cargo
 cargo install yupp
+
+# Or install via npm
+npm install -g yupppp
 
 # Scan branch diff before opening a PR
 yupp main..HEAD

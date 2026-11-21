@@ -1,6 +1,8 @@
 {
   "name": "yupppp",
-  "version": "0.1.1",
+  "version": "0.1.2",
+  "binaryVersion": "0.1.1",
+  "readmeFilename": "README.md",
   "description": "0-LLM Rust CLI & MCP gatekeeper that catches AI test theater, placeholder/stub slop, leaked secrets, and untested blast radius in milliseconds",
   "bin": {
     "yupp": "bin/yupp.js",

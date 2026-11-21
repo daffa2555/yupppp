@@ -10,7 +10,7 @@ const { execFileSync } = require("child_process");
 const pkg = require("./package.json");
 
 const REPO = "daffa2555/yupppp";
-const VERSION = `v${pkg.version}`;
+const VERSION = `v${pkg.binaryVersion || pkg.version}`;
 
 function resolveTarget() {
   const platform = process.platform;
