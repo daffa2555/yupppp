@@ -1,6 +1,6 @@
 [package]
 name = "yupp"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "0-LLM Rust CLI that catches AI test theater, silent slop, and PR blast radius in milliseconds"
 license = "MIT"

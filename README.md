@@ -14,14 +14,14 @@ Works alongside **Claude Code, Cursor, Codex, Aider**, or any human PR. No API k
 
 ### `yupp 👌` — Clean (exit `0`)
 ```text
-yupp v0.1.0 · scanned 1 files (+3 -0) in 6ms (0-LLM · Tree-sitter AST)
+yupp v0.1.1 · scanned 1 files (+3 -0) in 6ms (0-LLM · Tree-sitter AST)
 
 yupp 👌  (0 blockers, 0 warnings · 6ms)
 ```
 
 ### `hmm 🤔` — Warnings only, no blockers (exit `0`, or exit `1` with `--strict`)
 ```text
-yupp v0.1.0 · scanned 2 files (+14 -1) in 9ms (0-LLM · Tree-sitter AST)
+yupp v0.1.1 · scanned 2 files (+14 -1) in 9ms (0-LLM · Tree-sitter AST)
 
 [BLAST RADIUS] 1 modified symbol(s) with cross-file callers
   • src/billing.py:calculate_discount (2 callers) [NO TEST CALLER]
@@ -36,7 +36,7 @@ hmm 🤔  (0 blockers, 2 warnings · 9ms)
 
 ### `nope ❌` — Blockers detected (exit `1`)
 ```text
-yupp v0.1.0 · scanned 2 files (+9 -4) in 11ms (0-LLM · Tree-sitter AST)
+yupp v0.1.1 · scanned 2 files (+9 -4) in 11ms (0-LLM · Tree-sitter AST)
 
 [TEST THEATER] 2 finding(s)
   1. tests/test_auth.py:1   Test assertions reduced (-2 removed, +0 added) [test-theater/assertions-removed]
@@ -151,4 +151,4 @@ See [examples/github-action.yml](examples/github-action.yml) for a drop-in PR co
 
 ---
 
-*Built for fun to keep AI coding agents honest on local diffs (v0.1.0 — feedback and edge cases welcome).*
+*Built for fun to keep AI coding agents honest on local diffs (v0.1.1 — feedback and edge cases welcome).*
