@@ -1,9 +1,10 @@
 {
-  "name": "yupp-cli",
+  "name": "yupppp",
   "version": "0.1.1",
   "description": "0-LLM Rust CLI & MCP gatekeeper that catches AI test theater, placeholder/stub slop, leaked secrets, and untested blast radius in milliseconds",
   "bin": {
-    "yupp": "bin/yupp.js"
+    "yupp": "bin/yupp.js",
+    "yupppp": "bin/yupp.js"
   },
   "scripts": {
     "postinstall": "node install.js"
