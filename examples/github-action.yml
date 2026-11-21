@@ -1,0 +1,44 @@
+# Drop-in GitHub Action: copy to .github/workflows/yupp.yml in any repo
+name: yupp PR X-Ray
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  yupp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install yupp
+        run: cargo install --git https://github.com/daffa2555/yupppp
+
+      - name: Run yupp PR X-Ray
+        id: yupp
+        continue-on-error: true
+        run: |
+          yupp origin/${{ github.base_ref }}..HEAD --format pr-comment > yupp_report.md
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('yupp_report.md', 'utf8');
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            });
+
+      - name: Enforce blockers
+        if: steps.yupp.outputs.exit_code != '0'
+        run: exit 1
