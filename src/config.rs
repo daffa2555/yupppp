@@ -19,7 +19,7 @@ pub struct Config {
 }
 
 pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# yupp configuration (.yupp.toml)
-# Docs: https://github.com/yupp-cli/yupp
+# Docs: https://github.com/daffa2555/yupppp
 
 # Fail with exit code 1 on warnings as well as blockers
 strict = false
@@ -164,7 +164,30 @@ impl Config {
             if p.is_empty() {
                 continue;
             }
-            if let Some(suffix) = p.strip_prefix('*') {
+            if let Some(dir) = p.strip_prefix("**/").and_then(|s| s.strip_suffix("/**")) {
+                if !dir.is_empty()
+                    && (normalized.starts_with(&format!("{}/", dir))
+                        || normalized.contains(&format!("/{}/", dir))
+                        || normalized == dir)
+                {
+                    return true;
+                }
+            } else if let Some(prefix) = p.strip_suffix("/**") {
+                if !prefix.is_empty()
+                    && (normalized == prefix
+                        || normalized.starts_with(&format!("{}/", prefix))
+                        || normalized.contains(&format!("/{}/", prefix)))
+                {
+                    return true;
+                }
+            } else if let Some(suffix) = p.strip_prefix("**/") {
+                if normalized == suffix
+                    || normalized.ends_with(&format!("/{}", suffix))
+                    || (suffix.starts_with('*') && normalized.ends_with(&suffix[1..]))
+                {
+                    return true;
+                }
+            } else if let Some(suffix) = p.strip_prefix('*') {
                 if normalized.ends_with(suffix) {
                     return true;
                 }
@@ -276,7 +299,7 @@ fn assign_array(
         ));
     }
     match key {
-        "disable" => cfg.disable = items,
+        "disable" | "disabled_rules" => cfg.disable = items,
         "ignore" => cfg.ignore = items,
         _ => {}
     }

@@ -300,12 +300,20 @@ pub fn analyze_diff_with_options(
             // Mask string literals (including multiline strings via Tree-sitter node ranges)
             // so rule descriptions, docstrings, raw strings, and template literals containing
             // `"todo!()"` or `"console.log(1)"` do not trigger false positives.
-            let code_text = string_masker
+            let line_is_test = is_test
+                || string_masker
+                    .as_ref()
+                    .is_some_and(|m| m.is_rust_test_line(dl.line_no));
+            let code_with_comments = string_masker
                 .as_ref()
                 .and_then(|m| m.mask_line(dl.line_no, &dl.content))
                 .unwrap_or_else(|| strip_string_literals(text));
+            let code_only = string_masker
+                .as_ref()
+                .and_then(|m| m.mask_code_only(dl.line_no, &dl.content))
+                .unwrap_or_else(|| strip_inline_comment(lang, &code_with_comments));
 
-            if is_test && skip_re.is_match(&code_text) {
+            if line_is_test && skip_re.is_match(&code_only) {
                 findings.push(Finding {
                     severity: Severity::Blocker,
                     category: Category::TestTheater,
@@ -316,7 +324,7 @@ pub fn analyze_diff_with_options(
                 });
             }
 
-            if is_test && trivial_assert_re.is_match(&code_text) {
+            if line_is_test && trivial_assert_re.is_match(&code_only) {
                 findings.push(Finding {
                     severity: Severity::Blocker,
                     category: Category::TestTheater,
@@ -341,7 +349,7 @@ pub fn analyze_diff_with_options(
                 }
             }
 
-            if lang.is_some() && !is_comment && hard_debug_re.is_match(&code_text) {
+            if lang.is_some() && !is_comment && hard_debug_re.is_match(&code_only) {
                 findings.push(Finding {
                     severity: Severity::Warning,
                     category: Category::SilentSlop,
@@ -352,8 +360,8 @@ pub fn analyze_diff_with_options(
                 });
             }
 
-            if lang.is_some() && !is_test {
-                if !is_comment && soft_debug_re.is_match(&code_text) {
+            if lang.is_some() && !line_is_test {
+                if !is_comment && soft_debug_re.is_match(&code_only) {
                     findings.push(Finding {
                         severity: Severity::Warning,
                         category: Category::SilentSlop,
@@ -363,7 +371,7 @@ pub fn analyze_diff_with_options(
                         message: "Debug print leftover (console.log / dbg! / fmt.Println)".into(),
                     });
                 }
-                if suppress_re.is_match(&code_text) {
+                if suppress_re.is_match(&code_with_comments) {
                     findings.push(Finding {
                         severity: Severity::Warning,
                         category: Category::SilentSlop,
@@ -373,7 +381,7 @@ pub fn analyze_diff_with_options(
                         message: "Compiler/type-checker suppression added".into(),
                     });
                 }
-                if lang == Some(Lang::Rust) && unwrap_re.is_match(&code_text) && !is_comment {
+                if lang == Some(Lang::Rust) && unwrap_re.is_match(&code_only) && !is_comment {
                     findings.push(Finding {
                         severity: Severity::Warning,
                         category: Category::SilentSlop,
@@ -383,8 +391,8 @@ pub fn analyze_diff_with_options(
                         message: "New .unwrap()/.expect() panic hazard introduced".into(),
                     });
                 }
-                if (todo_re.is_match(&code_text) && !is_comment)
-                    || placeholder_comment_re.is_match(&code_text)
+                if (todo_re.is_match(&code_only) && !is_comment)
+                    || placeholder_comment_re.is_match(&code_with_comments)
                 {
                     findings.push(Finding {
                         severity: Severity::Warning,
@@ -527,8 +535,12 @@ pub fn analyze_diff_with_options(
     detect_duplicate_bodies(&body_fingerprints, &mut findings);
 
     // 5. Single repo walk for Blast Radius + Breaking Unupdated Callers + Untested New Public Functions
-    let (mut blast, test_refs) =
-        scan_repo_references(repo_root, &changed_symbols, &new_public_symbols);
+    let (mut blast, test_refs) = scan_repo_references(
+        repo_root,
+        &changed_symbols,
+        &new_public_symbols,
+        &opts.config,
+    );
 
     // Enrich blast radius and emit conservative (Warning) breaking change findings
     let mut breaking_by_key: BTreeMap<(String, String), &BreakingEvent> = BTreeMap::new();
@@ -707,14 +719,15 @@ fn is_generic_symbol_name(name: &str) -> bool {
     )
 }
 
-/// Tracks Tree-sitter string literal byte ranges across a source file so
-/// interior lines of multiline strings (Python `"""..."""` / `'''...'''`,
-/// Rust `r#"..."#`, JS/TS template literals `` `...` ``, Go raw strings `` `...` ``)
-/// are masked out before line-based slop checks.
+/// Tracks Tree-sitter string literal ranges, comment ranges, and Rust inline
+/// `#[cfg(test)]` / `#[test]` line spans so multiline strings, trailing inline
+/// comments, and Rust inline unit test modules are handled with AST precision.
 struct StringMasker<'a> {
     source: &'a str,
     line_spans: Vec<(usize, usize)>,
     string_ranges: Vec<(usize, usize)>,
+    string_and_comment_ranges: Vec<(usize, usize)>,
+    rust_test_lines: Vec<(usize, usize)>,
 }
 
 impl<'a> StringMasker<'a> {
@@ -737,14 +750,34 @@ impl<'a> StringMasker<'a> {
         collect_string_ranges(lang, tree.root_node(), &mut string_ranges);
         string_ranges.sort_unstable();
 
+        let mut comment_ranges = Vec::new();
+        collect_comment_ranges(tree.root_node(), &mut comment_ranges);
+
+        let mut string_and_comment_ranges = string_ranges.clone();
+        string_and_comment_ranges.extend(comment_ranges);
+        string_and_comment_ranges.sort_unstable();
+
+        let mut rust_test_lines = Vec::new();
+        if lang == Lang::Rust {
+            collect_rust_test_line_ranges(tree.root_node(), source.as_bytes(), &mut rust_test_lines);
+        }
+
         Some(Self {
             source,
             line_spans,
             string_ranges,
+            string_and_comment_ranges,
+            rust_test_lines,
         })
     }
 
-    fn mask_line(&self, line_no: usize, diff_line_content: &str) -> Option<String> {
+    fn is_rust_test_line(&self, line_no: usize) -> bool {
+        self.rust_test_lines
+            .iter()
+            .any(|&(start, end)| line_no >= start && line_no <= end)
+    }
+
+    fn mask_ranges(&self, line_no: usize, diff_line_content: &str, ranges: &[(usize, usize)]) -> Option<String> {
         if line_no == 0 || line_no > self.line_spans.len() {
             return None;
         }
@@ -754,14 +787,14 @@ impl<'a> StringMasker<'a> {
             return None;
         }
 
-        let idx = self.string_ranges.partition_point(|&(_, rend)| rend <= lstart);
-        if idx >= self.string_ranges.len() || self.string_ranges[idx].0 >= lend {
+        let idx = ranges.partition_point(|&(_, rend)| rend <= lstart);
+        if idx >= ranges.len() || ranges[idx].0 >= lend {
             return Some(disk_line.trim().to_string());
         }
 
         let mut out = String::with_capacity(lend - lstart);
         let mut cursor = lstart;
-        for &(rstart, rend) in &self.string_ranges[idx..] {
+        for &(rstart, rend) in &ranges[idx..] {
             if rstart >= lend {
                 break;
             }
@@ -779,6 +812,89 @@ impl<'a> StringMasker<'a> {
             out.push_str(&self.source[cursor..lend]);
         }
         Some(out.trim().to_string())
+    }
+
+    fn mask_line(&self, line_no: usize, diff_line_content: &str) -> Option<String> {
+        self.mask_ranges(line_no, diff_line_content, &self.string_ranges)
+    }
+
+    fn mask_code_only(&self, line_no: usize, diff_line_content: &str) -> Option<String> {
+        self.mask_ranges(line_no, diff_line_content, &self.string_and_comment_ranges)
+    }
+}
+
+fn collect_comment_ranges(node: Node, out: &mut Vec<(usize, usize)>) {
+    if matches!(node.kind(), "comment" | "line_comment" | "block_comment") {
+        out.push((node.start_byte(), node.end_byte()));
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_comment_ranges(child, out);
+    }
+}
+
+fn has_rust_cfg_test_attr(node: Node, bytes: &[u8]) -> bool {
+    let mut prev = node.prev_sibling();
+    while let Some(sib) = prev {
+        if sib.kind() == "attribute_item" {
+            let txt = sib.utf8_text(bytes).unwrap_or("");
+            let compact: String = txt.chars().filter(|c| !c.is_whitespace()).collect();
+            if compact.contains("cfg(test)") || compact.contains("cfg(all(test,") || compact.contains(",test))") {
+                return true;
+            }
+            prev = sib.prev_sibling();
+        } else {
+            break;
+        }
+    }
+    false
+}
+
+fn is_inside_rust_cfg_test(node: Node, bytes: &[u8]) -> bool {
+    let mut cur = Some(node);
+    while let Some(n) = cur {
+        if n.kind() == "mod_item" && has_rust_cfg_test_attr(n, bytes) {
+            return true;
+        }
+        if n.kind() == "function_item" && has_rust_test_attr(n, bytes) {
+            return true;
+        }
+        cur = n.parent();
+    }
+    false
+}
+
+fn collect_rust_test_line_ranges(node: Node, bytes: &[u8], out: &mut Vec<(usize, usize)>) {
+    if (node.kind() == "mod_item" && has_rust_cfg_test_attr(node, bytes))
+        || (node.kind() == "function_item" && has_rust_test_attr(node, bytes))
+    {
+        out.push((node.start_position().row + 1, node.end_position().row + 1));
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_rust_test_line_ranges(child, bytes, out);
+    }
+}
+
+fn strip_inline_comment(lang: Option<Lang>, code_with_strings_stripped: &str) -> String {
+    match lang {
+        Some(Lang::Python) => code_with_strings_stripped
+            .split('#')
+            .next()
+            .unwrap_or(code_with_strings_stripped)
+            .trim()
+            .to_string(),
+        Some(Lang::Rust | Lang::JavaScript | Lang::TypeScript | Lang::Go) => {
+            code_with_strings_stripped
+                .split("//")
+                .next()
+                .unwrap_or(code_with_strings_stripped)
+                .trim()
+                .to_string()
+        }
+        None => code_with_strings_stripped.to_string(),
     }
 }
 
@@ -902,6 +1018,9 @@ fn extract_signatures(lang: Lang, source: &str) -> BTreeMap<String, FnSignature>
     let mut stack = vec![tree.root_node()];
 
     while let Some(node) = stack.pop() {
+        if lang == Lang::Rust && node.kind() == "mod_item" && has_rust_cfg_test_attr(node, bytes) {
+            continue;
+        }
         if let Some(sig) = extract_fn_signature(lang, node, bytes) {
             let key = scoped_signature_key(lang, node, &sig.name, bytes);
             map.entry(key).or_insert(sig);
@@ -1243,10 +1362,14 @@ fn analyze_ast(
         // 3. Function/method definitions: empty tests, mock-testing-mock, stubs, blast radius, duplicate AST hash
         if let Some(name) = extract_fn_name(lang, node, bytes) {
             if touches_diff {
-                let is_test_fn = is_test
+                let in_rust_inline_test =
+                    lang == Lang::Rust && is_inside_rust_cfg_test(node, bytes);
+                let node_is_test = is_test || in_rust_inline_test;
+                let is_test_fn = (is_test
                     && (name.starts_with("test")
                         || name.starts_with("Test")
-                        || (lang == Lang::Rust && has_rust_test_attr(node, bytes)));
+                        || (lang == Lang::Rust && has_rust_test_attr(node, bytes))))
+                    || (lang == Lang::Rust && has_rust_test_attr(node, bytes));
                 if is_test_fn {
                     let txt = node.utf8_text(bytes).unwrap_or("");
                     let decorator_src = if lang == Lang::Python {
@@ -1286,7 +1409,7 @@ fn analyze_ast(
                             ),
                         });
                     }
-                } else if !is_test {
+                } else if !node_is_test {
                     diff_ctx.modified_symbols.insert(name.clone());
 
                     if !is_generic_symbol_name(&name) {
@@ -1843,10 +1966,113 @@ fn extract_fn_name(lang: Lang, node: Node, bytes: &[u8]) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+fn is_skipped_dir_name(name: &str) -> bool {
+    matches!(
+        name,
+        ".git"
+            | "node_modules"
+            | "target"
+            | ".next"
+            | "dist"
+            | "build"
+            | "out"
+            | "vendor"
+            | "__pycache__"
+            | ".venv"
+            | "venv"
+            | "coverage"
+            | ".turbo"
+            | ".cache"
+            | ".svelte-kit"
+            | ".nuxt"
+            | ".output"
+            | ".vercel"
+            | ".wrangler"
+            | "storybook-static"
+    )
+}
+
+fn is_skipped_rel_path(rel_str: &str, config: &Config) -> bool {
+    if config.is_ignored(rel_str) {
+        return true;
+    }
+    let lower = rel_str.to_ascii_lowercase();
+    if lower.ends_with(".min.js") || lower.ends_with(".min.ts") || lower.ends_with(".bundle.js") {
+        return true;
+    }
+    rel_str.split('/').any(is_skipped_dir_name)
+}
+
+fn collect_repo_source_files(repo_root: &Path, config: &Config) -> Vec<(String, std::path::PathBuf)> {
+    const MAX_SCAN_FILE_BYTES: u64 = 512 * 1024;
+
+    // Fast path: if this is a git repository, `git ls-files` respects `.gitignore`
+    // natively and avoids walking untracked build outputs and dependency trees.
+    if repo_root.join(".git").exists() {
+        if let Ok(output) = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args(["ls-files", "-z", "--cached", "--others", "--exclude-standard"])
+            .output()
+        {
+            if output.status.success() {
+                let mut files = Vec::new();
+                for raw in output.stdout.split(|&b| b == 0) {
+                    if raw.is_empty() {
+                        continue;
+                    }
+                    let Ok(rel_raw) = std::str::from_utf8(raw) else {
+                        continue;
+                    };
+                    let rel_str = rel_raw.replace('\\', "/");
+                    if detect_lang(&rel_str).is_none() || is_skipped_rel_path(&rel_str, config) {
+                        continue;
+                    }
+                    let full = repo_root.join(&rel_str);
+                    if let Ok(meta) = fs::metadata(&full) {
+                        if meta.is_file() && meta.len() <= MAX_SCAN_FILE_BYTES {
+                            files.push((rel_str, full));
+                        }
+                    }
+                }
+                return files;
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    for entry in WalkDir::new(repo_root)
+        .into_iter()
+        .filter_entry(|e| {
+            let name = e.file_name().to_string_lossy();
+            !is_skipped_dir_name(&name)
+        })
+        .flatten()
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let Ok(rel) = entry.path().strip_prefix(repo_root) else {
+            continue;
+        };
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if detect_lang(&rel_str).is_none() || is_skipped_rel_path(&rel_str, config) {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata() {
+            if meta.len() <= MAX_SCAN_FILE_BYTES {
+                files.push((rel_str, entry.path().to_path_buf()));
+            }
+        }
+    }
+    files
+}
+
 fn scan_repo_references(
     repo_root: &Path,
     changed: &[(String, String)],
     new_public: &[(String, String, usize)],
+    config: &Config,
 ) -> (Vec<BlastEntry>, BTreeSet<String>) {
     if changed.is_empty() && new_public.is_empty() {
         return (Vec::new(), BTreeSet::new());
@@ -1870,50 +2096,55 @@ fn scan_repo_references(
     let mut callers_map: BTreeMap<(String, String), Vec<CallerRef>> = BTreeMap::new();
     let mut test_refs: BTreeSet<String> = BTreeSet::new();
 
-    for entry in WalkDir::new(repo_root)
-        .into_iter()
-        .filter_entry(|e| {
-            let name = e.file_name().to_string_lossy();
-            !matches!(
-                name.as_ref(),
-                ".git" | "node_modules" | "target" | ".next" | "dist" | "__pycache__" | ".venv"
-            )
-        })
-        .flatten()
-    {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let Ok(rel) = entry.path().strip_prefix(repo_root) else {
-            continue;
-        };
-        let rel_str = rel.to_string_lossy().replace('\\', "/");
-        if detect_lang(&rel_str).is_none() {
-            continue;
-        }
-        let Ok(content) = fs::read_to_string(entry.path()) else {
+    for (rel_str, full_path) in collect_repo_source_files(repo_root, config) {
+        let Ok(content) = fs::read_to_string(&full_path) else {
             continue;
         };
         let is_test = is_test_path(&rel_str);
+        // For Rust non-test source files, detect inline `#[cfg(test)]` modules so
+        // inline unit tests count as real test coverage and test callers.
+        let rust_inline_test_slice: Option<&str> =
+            if !is_test && rel_str.ends_with(".rs") {
+                content.find("#[cfg(test)]").map(|idx| &content[idx..])
+            } else {
+                None
+            };
+        let rust_prod_slice: Option<&str> =
+            if !is_test && rel_str.ends_with(".rs") {
+                content.find("#[cfg(test)]").map(|idx| &content[..idx])
+            } else {
+                None
+            };
 
         for ((def_file, sym), re) in &unique_changed {
             if def_file == &rel_str {
                 continue;
             }
+            if !content.contains(sym.as_str()) {
+                continue;
+            }
             if re.is_match(&content) {
+                let caller_is_test = is_test
+                    || rust_prod_slice.is_some_and(|prod| !re.is_match(prod));
                 callers_map
                     .entry((def_file.clone(), sym.clone()))
                     .or_default()
                     .push(CallerRef {
                         file: rel_str.clone(),
-                        is_test,
+                        is_test: caller_is_test,
                     });
             }
         }
 
         if is_test {
             for (sym, re) in &unique_public {
-                if re.is_match(&content) {
+                if content.contains(sym.as_str()) && re.is_match(&content) {
+                    test_refs.insert(sym.clone());
+                }
+            }
+        } else if let Some(inline_tests) = rust_inline_test_slice {
+            for (sym, re) in &unique_public {
+                if inline_tests.contains(sym.as_str()) && re.is_match(inline_tests) {
                     test_refs.insert(sym.clone());
                 }
             }
@@ -1942,7 +2173,8 @@ pub fn compute_symbol_blast_radius(
 ) -> BlastEntry {
     let def = def_file.unwrap_or("").to_string();
     let changed = vec![(def.clone(), symbol.to_string())];
-    let (mut entries, _) = scan_repo_references(repo_root, &changed, &[]);
+    let config = Config::load(repo_root, None).unwrap_or_default();
+    let (mut entries, _) = scan_repo_references(repo_root, &changed, &[], &config);
     entries.pop().unwrap_or(BlastEntry {
         file: def,
         symbol: symbol.to_string(),

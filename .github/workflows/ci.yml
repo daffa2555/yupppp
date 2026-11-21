@@ -10,6 +10,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --locked
       - run: cargo build --release --locked
+      - name: Dogfood yupp on this repo
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            ./target/release/yupp "origin/${{ github.base_ref }}..HEAD"
+          elif git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
+            ./target/release/yupp HEAD~1..HEAD
+          else
+            ./target/release/yupp
+          fi

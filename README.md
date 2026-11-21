@@ -134,7 +134,7 @@ Run `yupp init` to create `.yupp.toml`:
 
 ```toml
 ignore = ["**/generated/**", "vendor/**"]
-disabled_rules = ["slop/debug-leftover"]
+disable = ["slop/debug-leftover"]
 
 [severity]
 "slop/rust-unwrap" = "warning"

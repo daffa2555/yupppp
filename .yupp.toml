@@ -1,0 +1,5 @@
+# yupp dogfooding configuration for the yupp repository itself
+ignore = [
+  "target/**",
+  "assets/**",
+]

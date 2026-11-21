@@ -1786,3 +1786,167 @@ fn multiline_strings_masked_in_historical_commit_range_and_staged_diff() {
 
     let _ = fs::remove_dir_all(dir);
 }
+
+#[test]
+fn rust_inline_cfg_test_module_skips_prod_slop_catches_empty_test_and_counts_coverage() {
+    let dir = make_temp_dir("rust-cfg-test");
+    fs::create_dir_all(dir.join("src")).unwrap();
+
+    let rs_src = "\
+pub fn parse_header(raw: &str) -> Option<&str> {
+    raw.split(':').next()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn helper() -> String {
+        Some(\"ok\").unwrap().to_string()
+    }
+
+    #[test]
+    fn parses_valid_header() {
+        let h = parse_header(\"a:b\").unwrap();
+        assert_eq!(h, \"a\");
+    }
+
+    #[test]
+    fn empty_inline_test() {
+        let _ = helper();
+    }
+}
+";
+    fs::write(dir.join("src/header.rs"), rs_src).unwrap();
+
+    let mut diff = String::from("+++ b/src/header.rs\n@@ -0,0 +1,24 @@\n");
+    for line in rs_src.lines() {
+        diff.push('+');
+        diff.push_str(line);
+        diff.push('\n');
+    }
+
+    let files = parse_unified_diff(&diff);
+    let (findings, _) = analyze_diff_with_options(&files, &dir, &AnalyzeOptions::default());
+
+    assert!(
+        !findings.iter().any(|f| f.rule == "slop/rust-unwrap"),
+        "inline #[cfg(test)] .unwrap() should not trigger slop/rust-unwrap: {:?}",
+        findings
+    );
+    assert!(
+        !findings
+            .iter()
+            .any(|f| f.rule == "test-theater/untested-new-public"),
+        "pub fn tested inside inline #[cfg(test)] should count as tested: {:?}",
+        findings
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.rule == "test-theater/empty-test" && f.message.contains("empty_inline_test")),
+        "empty #[test] inside inline #[cfg(test)] must still be caught: {:?}",
+        findings
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn inline_trailing_comment_does_not_trigger_todo_or_unwrap_slop() {
+    let dir = make_temp_dir("inline-trailing-comment");
+    fs::create_dir_all(dir.join("src")).unwrap();
+
+    let rs_src = "\
+pub fn classify(x: bool) -> bool {
+    let ok = x; // Rust `todo!()` / `unimplemented!()` and `.unwrap()` handled elsewhere
+    // TODO: implement logic here
+    ok
+}
+";
+    fs::write(dir.join("src/classify.rs"), rs_src).unwrap();
+
+    let mut diff = String::from("+++ b/src/classify.rs\n@@ -0,0 +1,5 @@\n");
+    for line in rs_src.lines() {
+        diff.push('+');
+        diff.push_str(line);
+        diff.push('\n');
+    }
+
+    let files = parse_unified_diff(&diff);
+    let (findings, _) = analyze_diff_with_options(&files, &dir, &AnalyzeOptions::default());
+
+    assert!(
+        !findings.iter().any(|f| f.rule == "slop/rust-unwrap"),
+        "inline comment mentioning .unwrap() should not trigger slop/rust-unwrap: {:?}",
+        findings
+    );
+    assert!(
+        !findings
+            .iter()
+            .any(|f| f.rule == "slop/unfinished-stub" && f.line == 2),
+        "inline explanatory comment mentioning todo!() should not trigger slop/unfinished-stub: {:?}",
+        findings
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.rule == "slop/unfinished-stub" && f.line == 3),
+        "real placeholder comment on line 3 must still trigger slop/unfinished-stub: {:?}",
+        findings
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn repo_scan_skips_build_out_minified_and_config_ignored_paths() {
+    let dir = make_temp_dir("skip-build-out");
+    fs::create_dir_all(dir.join("src")).unwrap();
+    fs::create_dir_all(dir.join("out/_next/static/chunks")).unwrap();
+    fs::create_dir_all(dir.join("generated")).unwrap();
+
+    fs::write(
+        dir.join("src/redact.js"),
+        "export function redactTokens(s) { return s; }\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("src/app.js"),
+        "import { redactTokens } from './redact';\nexport const v = redactTokens('x');\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("src/bundle.min.js"),
+        "redactTokens('minified');\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("out/_next/static/chunks/218.js"),
+        "redactTokens('build-output');\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("generated/client.js"),
+        "redactTokens('generated');\n",
+    )
+    .unwrap();
+
+    let diff = "+++ b/src/redact.js\n@@ -0,0 +1,1 @@\n+export function redactTokens(s) { return s; }\n";
+    let files = parse_unified_diff(diff);
+    let opts = AnalyzeOptions {
+        base_ref: None,
+        head_ref: None,
+        config: Config::parse_toml("ignore = [\"generated/**\"]\n").unwrap(),
+    };
+    let (_, blast) = analyze_diff_with_options(&files, &dir, &opts);
+
+    let entry = blast
+        .iter()
+        .find(|b| b.symbol == "redactTokens")
+        .expect("expected blast radius for redactTokens");
+    let caller_files: Vec<&str> = entry.callers.iter().map(|c| c.file.as_str()).collect();
+    assert_eq!(caller_files, vec!["src/app.js"]);
+
+    let _ = fs::remove_dir_all(dir);
+}
