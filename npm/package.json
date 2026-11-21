@@ -1,0 +1,40 @@
+{
+  "name": "yupp-cli",
+  "version": "0.1.1",
+  "description": "0-LLM Rust CLI & MCP gatekeeper that catches AI test theater, placeholder/stub slop, leaked secrets, and untested blast radius in milliseconds",
+  "bin": {
+    "yupp": "bin/yupp.js"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "files": [
+    "bin/yupp.js",
+    "install.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "cli",
+    "git",
+    "diff",
+    "code-review",
+    "tree-sitter",
+    "mcp",
+    "ai-agents",
+    "rust",
+    "linter"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/daffa2555/yupppp.git"
+  },
+  "homepage": "https://github.com/daffa2555/yupppp",
+  "bugs": {
+    "url": "https://github.com/daffa2555/yupppp/issues"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}

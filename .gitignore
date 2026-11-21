@@ -1,3 +1,6 @@
 /target
+npm/bin/yupp-native
+npm/bin/yupp.exe
+
 **/*.rs.bk
 .DS_Store
