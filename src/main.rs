@@ -1,11 +1,15 @@
 use clap::{Parser, Subcommand, ValueEnum};
+use std::fs;
 use std::io::{self, IsTerminal, Read};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::Instant;
-use yupp::ast::{analyze_diff_with_options, AnalyzeOptions, Severity};
+use yupp::ast::{
+    analyze_diff_with_options, collect_dir_source_files, AnalyzeOptions, Severity,
+    MAX_CHECK_FILE_BYTES,
+};
 use yupp::config::{init_config, Config};
-use yupp::diff::{parse_unified_diff, resolve_base_ref, resolve_head_ref};
+use yupp::diff::{parse_unified_diff, resolve_base_ref, resolve_head_ref, DiffLine, FileDiff};
 use yupp::mcp::run_mcp_stdio;
 use yupp::report::{
     render_pr_comment, render_sarif, render_terminal_with_color, Report, Verdict,
@@ -45,6 +49,12 @@ fn should_use_color(
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Scan a directory or single file directly without requiring a Git repository
+    Check {
+        /// File or directory path to scan (defaults to current directory)
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
     /// Generate a .yupp.toml config file (and optionally install a git hook)
     Init {
         /// Overwrite existing .yupp.toml or git hook
@@ -89,31 +99,31 @@ struct Cli {
     repo: PathBuf,
 
     /// Path to .yupp.toml config file (defaults to <repo>/.yupp.toml if present)
-    #[arg(long)]
+    #[arg(long, global = true)]
     config: Option<PathBuf>,
 
     /// Output format
-    #[arg(long, value_enum, default_value_t = Format::Terminal)]
+    #[arg(long, global = true, value_enum, default_value_t = Format::Terminal)]
     format: Format,
 
     /// Fail with exit code 1 on warnings as well as blockers
-    #[arg(long)]
+    #[arg(long, global = true)]
     strict: bool,
 
     /// Disable emoji in output (ASCII only)
-    #[arg(long)]
+    #[arg(long, global = true)]
     no_emoji: bool,
 
     /// Control ANSI color output in terminal mode (auto disables when stdout is not a TTY or NO_COLOR is set)
-    #[arg(long, value_enum, default_value_t = ColorMode::Auto)]
+    #[arg(long, global = true, value_enum, default_value_t = ColorMode::Auto)]
     color: ColorMode,
 
     /// Disable ANSI color output (equivalent to --color never)
-    #[arg(long)]
+    #[arg(long, global = true)]
     no_color: bool,
 }
 
-fn is_git_work_tree(repo: &std::path::Path) -> bool {
+fn is_git_work_tree(repo: &Path) -> bool {
     Command::new("git")
         .current_dir(repo)
         .args(["rev-parse", "--is-inside-work-tree"])
@@ -137,7 +147,7 @@ fn read_diff(cli: &Cli) -> Result<String, String> {
             .canonicalize()
             .unwrap_or_else(|_| cli.repo.clone());
         return Err(format!(
-            "not a git repository ({})\nhint: run `yupp` inside a git repo, pass `--repo <path>`, or pipe a diff via `yupp --stdin`",
+            "not a git repository ({})\nhint: run `yupp` inside a git repo, scan this folder without git via `yupp check .`, pass `--repo <path>`, or pipe a diff via `yupp --stdin`",
             abs.display()
         ));
     }
@@ -159,79 +169,148 @@ fn read_diff(cli: &Cli) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-fn main() -> ExitCode {
-    let cli = Cli::parse();
+fn file_diff_from_content(path: String, content: &str) -> FileDiff {
+    let added = content
+        .lines()
+        .enumerate()
+        .map(|(idx, line)| DiffLine {
+            line_no: idx + 1,
+            content: line.to_string(),
+        })
+        .collect();
+    FileDiff {
+        path,
+        added,
+        removed: Vec::new(),
+        is_deleted: false,
+    }
+}
 
-    if let Some(cmd) = cli.command {
-        match cmd {
-            Commands::Init { force, hook, repo } => {
-                match init_config(&repo, force, hook.as_deref()) {
-                    Ok(actions) => {
-                        for a in actions {
-                            println!("{}", a);
-                        }
-                        return ExitCode::SUCCESS;
-                    }
-                    Err(e) => {
-                        eprintln!("yupp init error: {}", e);
-                        return ExitCode::from(2);
-                    }
+fn load_config_for_check(scan_root: &Path, explicit_path: Option<&Path>) -> Result<Config, String> {
+    if let Some(p) = explicit_path {
+        if !p.is_absolute() && p.exists() {
+            let resolved = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+            return Config::load(scan_root, Some(&resolved));
+        }
+    }
+    Config::load(scan_root, explicit_path)
+}
+
+fn lexical_abs_path(path: &Path) -> Option<PathBuf> {
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    let mut out = PathBuf::new();
+    for comp in joined.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    Some(out)
+}
+
+fn resolve_single_file_target(target: &Path) -> (PathBuf, String) {
+    if let Some(abs_target) = lexical_abs_path(target) {
+        if let Some(parent) = abs_target.parent() {
+            // 1. Prefer nearest ancestor directory containing `.yupp.toml`
+            if let Some(root) = parent
+                .ancestors()
+                .find(|dir| dir.join(".yupp.toml").is_file())
+            {
+                if let Ok(rel) = abs_target.strip_prefix(root) {
+                    return (
+                        root.to_path_buf(),
+                        rel.to_string_lossy().replace('\\', "/"),
+                    );
                 }
             }
-            Commands::Mcp => {
-                if let Err(e) = run_mcp_stdio() {
-                    eprintln!("yupp mcp error: {}", e);
-                    return ExitCode::from(2);
+            // 2. Otherwise prefer nearest ancestor containing `.git`
+            if let Some(root) = parent.ancestors().find(|dir| dir.join(".git").exists()) {
+                if let Ok(rel) = abs_target.strip_prefix(root) {
+                    return (
+                        root.to_path_buf(),
+                        rel.to_string_lossy().replace('\\', "/"),
+                    );
                 }
-                return ExitCode::SUCCESS;
+            }
+        }
+        // 3. Otherwise, if the target is inside CWD, use CWD as scan_root so sibling
+        //    files/tests are discovered consistently whether passed as relative or absolute.
+        if let Ok(cwd) = std::env::current_dir() {
+            if let Ok(rel) = abs_target.strip_prefix(&cwd) {
+                return (cwd, rel.to_string_lossy().replace('\\', "/"));
             }
         }
     }
 
-    let started = Instant::now();
+    let scan_root = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let rel_path = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| target.to_string_lossy().replace('\\', "/"));
+    (scan_root, rel_path)
+}
 
-    let config = match Config::load(&cli.repo, cli.config.as_deref()) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("yupp config error: {}", e);
-            return ExitCode::from(2);
+fn collect_check_target(
+    target: &Path,
+    explicit_config: Option<&Path>,
+) -> Result<(PathBuf, Config, Vec<FileDiff>), String> {
+    let meta = fs::metadata(target)
+        .map_err(|e| format!("cannot access {}: {}", target.display(), e))?;
+
+    if meta.is_dir() {
+        let scan_root = target.to_path_buf();
+        let config = load_config_for_check(&scan_root, explicit_config)?;
+        let rel_paths = collect_dir_source_files(&scan_root, &config);
+        let mut files = Vec::with_capacity(rel_paths.len());
+        for rel_path in rel_paths {
+            let full_path = scan_root.join(&rel_path);
+            let Ok(file_meta) = fs::metadata(&full_path) else {
+                continue;
+            };
+            if !file_meta.is_file() || file_meta.len() > MAX_CHECK_FILE_BYTES {
+                continue;
+            }
+            let Ok(content) = fs::read_to_string(&full_path) else {
+                continue;
+            };
+            files.push(file_diff_from_content(rel_path, &content));
         }
-    };
-
-    let raw_diff = match read_diff(&cli) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("yupp error: {}", e);
-            return ExitCode::from(2);
-        }
-    };
-
-    let base_ref = if cli.stdin {
-        cli.range
-            .as_deref()
-            .and_then(|r| resolve_base_ref(Some(r), false, &cli.repo))
+        Ok((scan_root, config, files))
+    } else if meta.is_file() {
+        let (scan_root, rel_path) = resolve_single_file_target(target);
+        let config = load_config_for_check(&scan_root, explicit_config)?;
+        let content = fs::read_to_string(target)
+            .map_err(|e| format!("failed to read {}: {}", target.display(), e))?;
+        let files = vec![file_diff_from_content(rel_path, &content)];
+        Ok((scan_root, config, files))
     } else {
-        resolve_base_ref(cli.range.as_deref(), cli.staged, &cli.repo)
-    };
-    let head_ref = if cli.stdin {
-        cli.range
-            .as_deref()
-            .and_then(|r| resolve_head_ref(Some(r), false))
-    } else {
-        resolve_head_ref(cli.range.as_deref(), cli.staged)
-    };
+        Err(format!("unsupported path type: {}", target.display()))
+    }
+}
 
-    let files = parse_unified_diff(&raw_diff);
+fn run_analysis_and_report(
+    cli: &Cli,
+    scan_root: &Path,
+    files: &[FileDiff],
+    opts: AnalyzeOptions,
+    started: Instant,
+) -> ExitCode {
     let lines_added: usize = files.iter().map(|f| f.added.len()).sum();
     let lines_removed: usize = files.iter().map(|f| f.removed.len()).sum();
 
-    let strict = cli.strict || config.strict.unwrap_or(false);
-    let opts = AnalyzeOptions {
-        base_ref,
-        head_ref,
-        config,
-    };
-    let (findings, blast_radius) = analyze_diff_with_options(&files, &cli.repo, &opts);
+    let strict = cli.strict || opts.config.strict.unwrap_or(false);
+    let (findings, blast_radius) = analyze_diff_with_options(files, scan_root, &opts);
     let blockers = findings
         .iter()
         .filter(|f| f.severity == Severity::Blocker)
@@ -288,6 +367,94 @@ fn main() -> ExitCode {
     } else {
         ExitCode::from(1)
     }
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+
+    if let Some(ref cmd) = cli.command {
+        match cmd {
+            Commands::Check { path } => {
+                let started = Instant::now();
+                let (scan_root, config, files) =
+                    match collect_check_target(path, cli.config.as_deref()) {
+                        Ok(res) => res,
+                        Err(e) => {
+                            eprintln!("yupp check error: {}", e);
+                            return ExitCode::from(2);
+                        }
+                    };
+                let opts = AnalyzeOptions {
+                    base_ref: None,
+                    head_ref: None,
+                    config,
+                };
+                return run_analysis_and_report(&cli, &scan_root, &files, opts, started);
+            }
+            Commands::Init { force, hook, repo } => {
+                match init_config(repo, *force, hook.as_deref()) {
+                    Ok(actions) => {
+                        for a in actions {
+                            println!("{}", a);
+                        }
+                        return ExitCode::SUCCESS;
+                    }
+                    Err(e) => {
+                        eprintln!("yupp init error: {}", e);
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            Commands::Mcp => {
+                if let Err(e) = run_mcp_stdio() {
+                    eprintln!("yupp mcp error: {}", e);
+                    return ExitCode::from(2);
+                }
+                return ExitCode::SUCCESS;
+            }
+        }
+    }
+
+    let started = Instant::now();
+
+    let config = match Config::load(&cli.repo, cli.config.as_deref()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("yupp config error: {}", e);
+            return ExitCode::from(2);
+        }
+    };
+
+    let raw_diff = match read_diff(&cli) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("yupp error: {}", e);
+            return ExitCode::from(2);
+        }
+    };
+
+    let base_ref = if cli.stdin {
+        cli.range
+            .as_deref()
+            .and_then(|r| resolve_base_ref(Some(r), false, &cli.repo))
+    } else {
+        resolve_base_ref(cli.range.as_deref(), cli.staged, &cli.repo)
+    };
+    let head_ref = if cli.stdin {
+        cli.range
+            .as_deref()
+            .and_then(|r| resolve_head_ref(Some(r), false))
+    } else {
+        resolve_head_ref(cli.range.as_deref(), cli.staged)
+    };
+
+    let files = parse_unified_diff(&raw_diff);
+    let opts = AnalyzeOptions {
+        base_ref,
+        head_ref,
+        config,
+    };
+    run_analysis_and_report(&cli, &cli.repo, &files, opts, started)
 }
 
 #[cfg(test)]

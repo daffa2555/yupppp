@@ -73,6 +73,10 @@ yupp --staged
 # Pipe any unified diff
 git diff main..HEAD | yupp --stdin
 
+# Scan a folder or single file directly (no Git required)
+yupp check .
+yupp check src/app.ts
+
 # Generate .yupp.toml + optional git hook
 yupp init --hook pre-push
 ```

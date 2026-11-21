@@ -2394,8 +2394,15 @@ fn collect_repo_source_files(
         }
     }
 
+    collect_dir_source_files(repo_root, config)
+}
+
+/// Recursively collect supported source files (`.rs`, `.py`, `.ts`, `.tsx`, `.js`, `.jsx`,
+/// `.mjs`, `.cjs`, `.go`) under `root`, skipping build/vendor/ignored directories, minified
+/// bundles, and `.yupp.toml` ignore patterns. Does not require a Git repository.
+pub fn collect_dir_source_files(root: &Path, config: &Config) -> Vec<String> {
     let mut files = Vec::new();
-    for entry in WalkDir::new(repo_root)
+    for entry in WalkDir::new(root)
         .into_iter()
         .filter_entry(|e| {
             if e.depth() == 0 {
@@ -2406,9 +2413,9 @@ fn collect_repo_source_files(
                 return false;
             }
             if e.file_type().is_dir() && !config.ignore.is_empty() {
-                if let Ok(rel) = e.path().strip_prefix(repo_root) {
+                if let Ok(rel) = e.path().strip_prefix(root) {
                     let rel_str = rel.to_string_lossy();
-                    if config.is_ignored(&rel_str) {
+                    if config.is_ignored(&rel_str) || config.is_ignored(&format!("{}/", rel_str)) {
                         return false;
                     }
                 }
@@ -2420,7 +2427,7 @@ fn collect_repo_source_files(
         if !entry.file_type().is_file() {
             continue;
         }
-        let Ok(rel) = entry.path().strip_prefix(repo_root) else {
+        let Ok(rel) = entry.path().strip_prefix(root) else {
             continue;
         };
         let rel_str = rel.to_string_lossy().replace('\\', "/");
@@ -2429,8 +2436,12 @@ fn collect_repo_source_files(
         }
         files.push(rel_str);
     }
+    files.sort();
     files
 }
+
+/// Maximum file size (in bytes) read during directory scans.
+pub const MAX_CHECK_FILE_BYTES: u64 = MAX_SCAN_FILE_BYTES;
 
 #[inline]
 fn is_word_char(c: char) -> bool {

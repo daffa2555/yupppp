@@ -2018,3 +2018,452 @@ fn cli_outside_git_repo_prints_clean_hint_instead_of_git_usage_spam() {
 
     let _ = fs::remove_dir_all(dir);
 }
+
+#[test]
+fn cli_outside_git_repo_hint_mentions_yupp_check() {
+    let dir = make_temp_dir("non-git-hint-check");
+    let out = Command::new(yupp_bin())
+        .args(["--repo", &dir.to_string_lossy()])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("yupp check ."),
+        "expected non-git hint to mention `yupp check .`, got: {}",
+        stderr
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn cli_check_directory_without_git_scans_supported_files_and_skips_ignored() {
+    let dir = make_temp_dir("check-dir-no-git");
+    fs::create_dir_all(dir.join("src")).unwrap();
+    fs::create_dir_all(dir.join("tests")).unwrap();
+    fs::create_dir_all(dir.join("node_modules/pkg")).unwrap();
+    fs::create_dir_all(dir.join("target/debug")).unwrap();
+    fs::create_dir_all(dir.join("dist")).unwrap();
+    fs::create_dir_all(dir.join("out/_next")).unwrap();
+    fs::create_dir_all(dir.join("generated")).unwrap();
+
+    fs::write(dir.join(".yupp.toml"), "ignore = [\"generated/\"]\n").unwrap();
+    fs::write(
+        dir.join("src/app.ts"),
+        "export function loadUser() {\n  try {\n    return 1;\n  } catch (e) {}\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("src/service.rs"),
+        "pub fn parse_port(s: &str) -> u16 {\n    s.parse().unwrap()\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("src/ok.py"),
+        "def add(a: int, b: int) -> int:\n    return a + b\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("tests/test_bad.py"),
+        "def test_always_passes():\n    assert True\n",
+    )
+    .unwrap();
+
+    // Noise directories, minified files, ignored paths, and non-code files must be skipped
+    let fake_key = format!("sk_{}_{}", "live", "99A8B7C6D5E4F3G2H1J0K9L8");
+    fs::write(
+        dir.join("node_modules/pkg/index.js"),
+        format!("const k = \"{}\";\ntry {{ x(); }} catch (e) {{}}\n", fake_key),
+    )
+    .unwrap();
+    fs::write(
+        dir.join("target/debug/gen.rs"),
+        "pub fn gen() { Some(1).unwrap(); }\n",
+    )
+    .unwrap();
+    fs::write(dir.join("dist/out.js"), "try { x(); } catch (e) {}\n").unwrap();
+    fs::write(dir.join("out/_next/chunk.js"), "try { x(); } catch (e) {}\n").unwrap();
+    fs::write(dir.join("src/bundle.min.js"), "try { x(); } catch (e) {}\n").unwrap();
+    fs::write(
+        dir.join("generated/auto.ts"),
+        "export function gen() { try { return 1; } catch (e) {} }\n",
+    )
+    .unwrap();
+    fs::write(dir.join("README.md"), "# Notes\n").unwrap();
+
+    let out = Command::new(yupp_bin())
+        .args(["check", &dir.to_string_lossy(), "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "expected exit 1 for blocker, stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let json: Value = serde_json::from_slice(&out.stdout).expect("valid JSON output");
+    assert_eq!(json["verdict"], "nope");
+    assert_eq!(json["passed"], false);
+    assert_eq!(json["files_scanned"], 4);
+
+    let findings = json["findings"].as_array().unwrap();
+    let rules: Vec<&str> = findings
+        .iter()
+        .filter_map(|f| f["rule"].as_str())
+        .collect();
+    assert!(rules.contains(&"test-theater/trivial-assertion"), "got: {:?}", rules);
+    assert!(rules.contains(&"slop/empty-catch"), "got: {:?}", rules);
+    assert!(rules.contains(&"slop/rust-unwrap"), "got: {:?}", rules);
+    assert!(!rules.contains(&"secret/stripe"), "node_modules should be skipped: {:?}", findings);
+
+    for f in findings {
+        let file = f["file"].as_str().unwrap_or("");
+        assert!(!file.contains("node_modules"), "unexpected finding in {}", file);
+        assert!(!file.contains("target/"), "unexpected finding in {}", file);
+        assert!(!file.contains("dist/"), "unexpected finding in {}", file);
+        assert!(!file.contains("out/"), "unexpected finding in {}", file);
+        assert!(!file.contains("bundle.min.js"), "unexpected finding in {}", file);
+        assert!(!file.contains("generated/"), "unexpected finding in {}", file);
+    }
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn cli_check_single_file_flags_formats_config_and_exit_codes() {
+    let dir = make_temp_dir("check-single-file");
+    fs::create_dir_all(dir.join("src")).unwrap();
+
+    let clean_file = dir.join("src/clean.go");
+    fs::write(
+        &clean_file,
+        "package main\n\nfunc add(a int, b int) int {\n\treturn a + b\n}\n",
+    )
+    .unwrap();
+
+    let warn_file = dir.join("src/warn.rs");
+    fs::write(
+        &warn_file,
+        "fn parse_val(s: &str) -> i32 {\n    s.parse().unwrap()\n}\n",
+    )
+    .unwrap();
+
+    let secret_file = dir.join("src/secret.py");
+    let fake_key = format!("sk_{}_{}", "live", "51N9x8K2f9a8b7c6d5e4f3g2h1");
+    fs::write(&secret_file, format!("API_KEY = \"{}\"\n", fake_key)).unwrap();
+
+    let custom_cfg = dir.join("custom.toml");
+    fs::write(&custom_cfg, "disable = [\"slop/rust-unwrap\"]\n").unwrap();
+
+    // 1. Clean single file -> exit 0, verdict yupp
+    let ok = Command::new(yupp_bin())
+        .args(["check", &clean_file.to_string_lossy(), "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(ok.status.code(), Some(0));
+    let ok_json: Value = serde_json::from_slice(&ok.stdout).unwrap();
+    assert_eq!(ok_json["verdict"], "yupp");
+    assert_eq!(ok_json["files_scanned"], 1);
+
+    // 2. Warning-only file -> exit 0 (hmm), and exit 1 (nope) with --strict
+    let warn = Command::new(yupp_bin())
+        .args([
+            "check",
+            &warn_file.to_string_lossy(),
+            "--no-emoji",
+            "--no-color",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(warn.status.code(), Some(0));
+    let warn_stdout = String::from_utf8_lossy(&warn.stdout);
+    assert!(warn_stdout.contains("hmm [WARN]"), "got: {}", warn_stdout);
+    assert!(!warn_stdout.contains("\x1b["), "no ANSI escapes expected");
+
+    let warn_strict = Command::new(yupp_bin())
+        .args(["check", &warn_file.to_string_lossy(), "--strict", "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(warn_strict.status.code(), Some(1));
+    let strict_json: Value = serde_json::from_slice(&warn_strict.stdout).unwrap();
+    assert_eq!(strict_json["verdict"], "nope");
+
+    // 3. --color always emits ANSI escapes
+    let warn_color = Command::new(yupp_bin())
+        .args(["check", &warn_file.to_string_lossy(), "--color", "always"])
+        .output()
+        .unwrap();
+    assert_eq!(warn_color.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&warn_color.stdout).contains("\x1b["));
+
+    // 4. --format sarif & --format pr-comment
+    let sarif = Command::new(yupp_bin())
+        .args(["check", &warn_file.to_string_lossy(), "--format", "sarif"])
+        .output()
+        .unwrap();
+    assert_eq!(sarif.status.code(), Some(0));
+    let sarif_json: Value = serde_json::from_slice(&sarif.stdout).unwrap();
+    assert_eq!(sarif_json["version"], "2.1.0");
+    assert_eq!(
+        sarif_json["runs"][0]["results"][0]["ruleId"],
+        "slop/rust-unwrap"
+    );
+
+    let pr = Command::new(yupp_bin())
+        .args([
+            "check",
+            &warn_file.to_string_lossy(),
+            "--format",
+            "pr-comment",
+            "--no-emoji",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(pr.status.code(), Some(0));
+    let pr_stdout = String::from_utf8_lossy(&pr.stdout);
+    assert!(pr_stdout.contains("### hmm [WARN]"), "got: {}", pr_stdout);
+    assert!(pr_stdout.contains("slop/rust-unwrap"), "got: {}", pr_stdout);
+
+    // 5. --config disables rule -> exit 0, verdict yupp
+    let configured = Command::new(yupp_bin())
+        .args([
+            "check",
+            &warn_file.to_string_lossy(),
+            "--config",
+            &custom_cfg.to_string_lossy(),
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(configured.status.code(), Some(0));
+    let cfg_json: Value = serde_json::from_slice(&configured.stdout).unwrap();
+    assert_eq!(cfg_json["verdict"], "yupp");
+
+    // 6. Relative path invocation picks up .yupp.toml from CWD
+    fs::write(dir.join(".yupp.toml"), "disable = [\"slop/rust-unwrap\"]\n").unwrap();
+    let rel_run = Command::new(yupp_bin())
+        .current_dir(&dir)
+        .args(["check", "src/warn.rs", "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(rel_run.status.code(), Some(0));
+    let rel_json: Value = serde_json::from_slice(&rel_run.stdout).unwrap();
+    assert_eq!(rel_json["verdict"], "yupp");
+
+    // 7. Blocker single file -> exit 1, verdict nope
+    let blocker = Command::new(yupp_bin())
+        .args(["check", &secret_file.to_string_lossy(), "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(blocker.status.code(), Some(1));
+    let blocker_json: Value = serde_json::from_slice(&blocker.stdout).unwrap();
+    assert_eq!(blocker_json["verdict"], "nope");
+    assert_eq!(blocker_json["blockers"], 1);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn cli_check_default_cwd_empty_dir_and_error_exit_codes() {
+    let dir = make_temp_dir("check-edge-cases");
+
+    // 1. Default `yupp check` (no path arg) in empty non-git dir -> exit 0, files_scanned 0
+    let empty_run = Command::new(yupp_bin())
+        .current_dir(&dir)
+        .args(["check", "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(empty_run.status.code(), Some(0));
+    let empty_json: Value = serde_json::from_slice(&empty_run.stdout).unwrap();
+    assert_eq!(empty_json["verdict"], "yupp");
+    assert_eq!(empty_json["files_scanned"], 0);
+
+    // 2. Non-existent path -> exit 2
+    let missing = Command::new(yupp_bin())
+        .args(["check", &dir.join("does-not-exist").to_string_lossy()])
+        .output()
+        .unwrap();
+    assert_eq!(missing.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("yupp check error:"));
+
+    // 3. Invalid --config -> exit 2
+    let bad_cfg = Command::new(yupp_bin())
+        .args([
+            "check",
+            &dir.to_string_lossy(),
+            "--config",
+            &dir.join("missing.toml").to_string_lossy(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(bad_cfg.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&bad_cfg.stderr).contains("yupp check error:"));
+
+    // 4. Non-UTF-8 binary file passed directly -> exit 2
+    let bin_file = dir.join("blob.bin");
+    fs::write(&bin_file, [0xffu8, 0xfe, 0x00, 0x80]).unwrap();
+    let bin_run = Command::new(yupp_bin())
+        .args(["check", &bin_file.to_string_lossy()])
+        .output()
+        .unwrap();
+    assert_eq!(bin_run.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&bin_run.stderr).contains("yupp check error:"));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn cli_check_single_file_discovers_ancestor_config_tests_and_ignores() {
+    let dir = make_temp_dir("check-ancestor-root");
+    fs::create_dir_all(dir.join("src")).unwrap();
+    fs::create_dir_all(dir.join("tests")).unwrap();
+    fs::create_dir_all(dir.join("generated")).unwrap();
+
+    fs::write(
+        dir.join(".yupp.toml"),
+        "disable = [\"slop/rust-unwrap\"]\nignore = [\"generated/\"]\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("src/app.rs"),
+        "pub fn parse_num(s: &str) -> i32 {\n    s.parse().unwrap()\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("tests/app_test.rs"),
+        "fn test_parse_num() {\n    assert_eq!(parse_num(\"42\"), 42);\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("generated/auto.ts"),
+        "export function gen() { try { return 1; } catch (e) {} }\n",
+    )
+    .unwrap();
+
+    // 1. Absolute path from outside project discovers ancestor .yupp.toml + sibling tests/
+    let abs_run = Command::new(yupp_bin())
+        .args([
+            "check",
+            &dir.join("src/app.rs").to_string_lossy(),
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(abs_run.status.code(), Some(0));
+    let abs_json: Value = serde_json::from_slice(&abs_run.stdout).unwrap();
+    assert_eq!(abs_json["verdict"], "yupp", "got: {}", abs_json);
+    assert_eq!(abs_json["warnings"], 0);
+    assert_eq!(abs_json["blast_radius"][0]["file"], "src/app.rs");
+
+    // 2. Invocation from subdirectory CWD (`cd src && yupp check app.rs`) also finds ancestor root
+    let subdir_run = Command::new(yupp_bin())
+        .current_dir(dir.join("src"))
+        .args(["check", "app.rs", "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(subdir_run.status.code(), Some(0));
+    let subdir_json: Value = serde_json::from_slice(&subdir_run.stdout).unwrap();
+    assert_eq!(subdir_json["verdict"], "yupp", "got: {}", subdir_json);
+    assert_eq!(subdir_json["warnings"], 0);
+
+    // 3. Single file matching ancestor `.yupp.toml` ignore rule is ignored even via absolute path
+    let ignored_run = Command::new(yupp_bin())
+        .args([
+            "check",
+            &dir.join("generated/auto.ts").to_string_lossy(),
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(ignored_run.status.code(), Some(0));
+    let ignored_json: Value = serde_json::from_slice(&ignored_run.stdout).unwrap();
+    assert_eq!(ignored_json["verdict"], "yupp", "got: {}", ignored_json);
+    assert_eq!(ignored_json["blockers"], 0);
+    assert_eq!(ignored_json["warnings"], 0);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn cli_check_relative_config_git_untracked_and_oversized_file() {
+    let cwd_dir = make_temp_dir("check-rel-cfg-cwd");
+    let proj_dir = make_temp_dir("check-rel-cfg-proj");
+    init_git_repo(&proj_dir);
+    fs::create_dir_all(proj_dir.join("src")).unwrap();
+
+    // Commit one clean tracked file
+    fs::write(proj_dir.join("src/tracked.rs"), "fn ok() -> i32 { 1 }\n").unwrap();
+    git(&proj_dir, &["add", "."]);
+    git(&proj_dir, &["commit", "-m", "initial"]);
+
+    // Add an untracked file with a warning and an oversized (>512 KiB) file with a blocker
+    fs::write(
+        proj_dir.join("src/untracked.rs"),
+        "fn parse_val(s: &str) -> i32 {\n    s.parse().unwrap()\n}\n",
+    )
+    .unwrap();
+    let fake_key = format!("sk_{}_{}", "live", "99A8B7C6D5E4F3G2H1J0K9L8");
+    let mut big_content = format!("const K = \"{}\";\n", fake_key);
+    big_content.push_str(&"// padding line\n".repeat(40_000)); // > 512 KiB
+    fs::write(proj_dir.join("src/huge.ts"), big_content).unwrap();
+
+    // Put same-named custom.toml in BOTH cwd_dir (disables rust-unwrap) and proj_dir (strict = true)
+    fs::write(
+        cwd_dir.join("custom.toml"),
+        "disable = [\"slop/rust-unwrap\"]\n",
+    )
+    .unwrap();
+    fs::write(proj_dir.join("custom.toml"), "strict = true\n").unwrap();
+    fs::write(proj_dir.join("proj_only.toml"), "strict = true\n").unwrap();
+
+    // 1. Relative --config in CWD must take precedence over same-named file in target dir;
+    //    untracked.rs IS scanned (2 files total: tracked.rs + untracked.rs; huge.ts skipped, .git skipped)
+    let cwd_cfg_run = Command::new(yupp_bin())
+        .current_dir(&cwd_dir)
+        .args([
+            "check",
+            &proj_dir.to_string_lossy(),
+            "--config",
+            "./custom.toml",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(cwd_cfg_run.status.code(), Some(0));
+    let cwd_cfg_json: Value = serde_json::from_slice(&cwd_cfg_run.stdout).unwrap();
+    assert_eq!(cwd_cfg_json["verdict"], "yupp", "got: {}", cwd_cfg_json);
+    assert_eq!(cwd_cfg_json["files_scanned"], 2);
+    assert_eq!(cwd_cfg_json["blockers"], 0);
+    assert_eq!(cwd_cfg_json["warnings"], 0);
+
+    // 2. Relative --config not in CWD falls back to target dir's proj_only.toml (strict = true),
+    //    catching slop/rust-unwrap in untracked.rs -> exit 1 (nope)
+    let fallback_cfg_run = Command::new(yupp_bin())
+        .current_dir(&cwd_dir)
+        .args([
+            "check",
+            &proj_dir.to_string_lossy(),
+            "--config",
+            "proj_only.toml",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(fallback_cfg_run.status.code(), Some(1));
+    let fb_json: Value = serde_json::from_slice(&fallback_cfg_run.stdout).unwrap();
+    assert_eq!(fb_json["verdict"], "nope", "got: {}", fb_json);
+    assert_eq!(fb_json["files_scanned"], 2);
+    assert_eq!(fb_json["warnings"], 1);
+    assert_eq!(fb_json["findings"][0]["file"], "src/untracked.rs");
+    assert_eq!(fb_json["findings"][0]["rule"], "slop/rust-unwrap");
+
+    let _ = fs::remove_dir_all(cwd_dir);
+    let _ = fs::remove_dir_all(proj_dir);
+}
